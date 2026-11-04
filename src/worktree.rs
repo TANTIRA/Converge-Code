@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -12,21 +14,34 @@ pub fn add(repo: &Path, destination: &Path, branch: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .map_err(|error| Error::new(format!("create {}: {error}", parent.display())))?;
     }
-    let status = Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            "-b",
-            branch,
-            &destination.to_string_lossy(),
-        ])
-        .current_dir(repo)
-        .status()
-        .map_err(|error| Error::new(format!("git worktree failed to start: {error}")))?;
-    if !status.success() {
+    let mut attempt = 0;
+    loop {
+        let output = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                &destination.to_string_lossy(),
+            ])
+            .current_dir(repo)
+            .output()
+            .map_err(|error| Error::new(format!("git worktree failed to start: {error}")))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if attempt < 8 && detail.to_ascii_lowercase().contains("lock") {
+            attempt += 1;
+            thread::sleep(Duration::from_millis(25 * attempt));
+            continue;
+        }
         return Err(Error::new("git worktree add failed"));
     }
-    Ok(())
 }
 
 pub fn write_delegation(dir: &Path, goal: &str, worktree: &Path) -> Result<PathBuf> {

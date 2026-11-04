@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Agentic coding CLI"
 license = "MIT"
+default-run = "converge"
 
 [[bin]]
 name = "converge"

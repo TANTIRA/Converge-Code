@@ -1,4 +1,3 @@
-use std::env;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -35,21 +34,16 @@ pub struct OpenAiCompatible {
 }
 
 impl OpenAiCompatible {
-    pub fn from_env() -> Result<Self> {
-        let base_url = required("CONVERGE_BASE_URL")?;
-        let api_key = required("CONVERGE_API_KEY")?;
-        let model = required("CONVERGE_MODEL")?;
-        if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
-            return Err(Error::new("CONVERGE_BASE_URL must be an http or https URL"));
-        }
-        let endpoint = chat_endpoint(&base_url);
+    pub fn open(home: &std::path::Path) -> Result<Self> {
+        let resolved = crate::provider::resolve(home)?;
+        let endpoint = chat_endpoint(&resolved.profile.base_url);
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(120))
             .build();
         Ok(Self {
             endpoint,
-            api_key,
-            model,
+            api_key: resolved.api_key,
+            model: resolved.profile.model,
             agent,
         })
     }
@@ -128,13 +122,6 @@ fn clip_error_body(body: &str) -> String {
         clipped.push_str("...");
     }
     clipped
-}
-
-fn required(name: &str) -> Result<String> {
-    match env::var(name) {
-        Ok(value) if !value.is_empty() => Ok(value),
-        _ => Err(Error::new(format!("{name} is required"))),
-    }
 }
 
 fn chat_endpoint(base_url: &str) -> String {

@@ -1,0 +1,35 @@
+[package]
+name = "converge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.converge]
+path = ".."
+
+[[bin]]
+name = "fuzz_cli"
+path = "fuzz_targets/fuzz_cli.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_admit"
+path = "fuzz_targets/fuzz_admit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_edit"
+path = "fuzz_targets/fuzz_edit.rs"
+test = false
+doc = false
+bench = false

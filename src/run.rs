@@ -13,7 +13,6 @@ use crate::mcp;
 use crate::model::{self, Model};
 use crate::modes;
 use crate::session::{self, Budget, Session};
-use crate::shell;
 
 const MAX_OUTPUT: usize = 100_000;
 
@@ -22,9 +21,18 @@ pub fn stop_allowed(test_status: i32) -> bool {
 }
 
 pub fn run_print(cwd: &Path, args: &Args) -> Result<i32> {
-    let workspace = git::identify(cwd)?;
-    let mut model = model::OpenAiCompatible::from_env()?;
     let home = home::converge_home()?;
+    if crate::backend::selected(&home)? != "converge" {
+        return crate::backend::run_external(
+            cwd,
+            &home,
+            &args.prompt,
+            &args.test_command,
+            args.goal.clone(),
+        );
+    }
+    let workspace = git::identify(cwd)?;
+    let mut model = model::OpenAiCompatible::open(&home)?;
     let instructions = instructions::load_scoped(
         &workspace.toplevel,
         Some(&instructions::organization_instructions()),
@@ -113,7 +121,7 @@ fn execute(
             return Ok(1);
         }
         if turn.tool_calls.is_empty() {
-            let output = shell::run(&session.workspace, test_command)?;
+            let output = modes::run_session_shell(session, test_command)?;
             session::append(
                 session,
                 &json!({
@@ -150,7 +158,11 @@ fn execute(
             return Ok(1);
         }
         for call in &turn.tool_calls {
-            let result = dispatch(session, &call.name, &call.arguments);
+            if let Some(code) = modes::unattended_auto_exit(session, &call.name, &call.arguments) {
+                session::append(session, &json!({"kind": "denied", "name": call.name}))?;
+                return Ok(code);
+            }
+            let result = dispatch(session, &call.name, &call.arguments, false);
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -164,8 +176,8 @@ fn execute(
     }
 }
 
-fn dispatch(session: &Session, name: &str, arguments: &str) -> String {
-    if let Err(error) = modes::admit(session, name, arguments, false) {
+pub(crate) fn dispatch(session: &Session, name: &str, arguments: &str, tty: bool) -> String {
+    if let Err(error) = modes::admit(session, name, arguments, tty) {
         return error.message;
     }
     let root = &session.workspace;
@@ -182,7 +194,7 @@ fn dispatch(session: &Session, name: &str, arguments: &str) -> String {
         }
         "shell" => {
             let command = parsed.get("command").and_then(Value::as_str).unwrap_or("");
-            match shell::run(root, command) {
+            match modes::run_session_shell(session, command) {
                 Ok(output) => format!(
                     "status: {}\nstdout:\n{}\nstderr:\n{}",
                     output.status,

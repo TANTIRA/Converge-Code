@@ -38,6 +38,11 @@ fn main() -> ExitCode {
         Invocation::ModePermission(mode) => converge::set_permission_mode_cli(&cwd, &mode),
         Invocation::Tasks => converge::print_tasks(&cwd),
         Invocation::MmdpPut(name) => converge::mmdp_put_laptop(&cwd, &name),
+        Invocation::ProviderList => converge::list_providers_cli(),
+        Invocation::ProviderUse(name) => converge::use_provider_cli(&name),
+        Invocation::Setup => converge::setup_cli(),
+        Invocation::BackendShow => converge::show_backend_cli(),
+        Invocation::BackendUse(name) => converge::use_backend_cli(&name),
     };
     match result {
         Ok(0) => ExitCode::SUCCESS,

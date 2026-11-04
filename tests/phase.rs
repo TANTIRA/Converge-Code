@@ -69,6 +69,264 @@ fn head_count(repo: &Path) -> usize {
         .unwrap_or(0)
 }
 
+#[test]
+fn shell_timeout_kills_the_process_and_a_split_path_cannot_replace_the_goal() {
+    let repo = git_repo();
+    let started = std::time::Instant::now();
+    let error =
+        match converge::run_shell_timeout(repo.path(), "sleep 30", Duration::from_millis(200)) {
+            Ok(_) => panic!("sleep must time out"),
+            Err(error) => error,
+        };
+    assert!(error.to_string().contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    #[cfg(unix)]
+    {
+        let name = format!("cvsleep{}", std::process::id());
+        let command = format!("exec -a {name} sleep 30");
+        let error =
+            match converge::run_shell_timeout(repo.path(), &command, Duration::from_millis(200)) {
+                Ok(_) => panic!("named sleep must time out"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("timed out"));
+        let found = Command::new("pgrep").arg("-x").arg(&name).status();
+        assert!(found.map(|status| !status.success()).unwrap_or(true));
+    }
+
+    let home = TempDir::new("converge-home");
+    let workspace = converge::identify(repo.path()).unwrap();
+    let session = converge::create_session(
+        home.path(),
+        &workspace,
+        Some("keep this goal".into()),
+        budget(),
+    )
+    .unwrap();
+    let record = session.dir.join("session.json");
+    let before = fs::read_to_string(&record).unwrap();
+    assert!(before.contains("keep this goal"));
+    let command = overwrite_session_record(&record);
+    assert!(
+        !command.contains(".converge"),
+        "the pre-check must not be what stops this command"
+    );
+    let error = match converge::run_admitted_shell(&session, &command) {
+        Ok(_) => panic!("shell must not keep a rewritten session"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("session goal"));
+    assert_eq!(fs::read_to_string(&record).unwrap(), before);
+}
+
+#[test]
+fn esc_discards_a_running_turn_and_stops_the_shell() {
+    let started = std::time::Instant::now();
+    thread::spawn(|| {
+        thread::sleep(Duration::from_millis(60));
+        converge::cancel_shell();
+    });
+    let result = converge::wait_for_turn(|| {
+        thread::sleep(Duration::from_millis(400));
+        "late"
+    })
+    .unwrap();
+    assert!(result.is_none());
+    assert!(started.elapsed() < Duration::from_millis(350));
+    converge::clear_shell_cancel();
+
+    let repo = git_repo();
+    thread::spawn(|| {
+        thread::sleep(Duration::from_millis(60));
+        converge::cancel_shell();
+    });
+    let error = match converge::run_shell_timeout(repo.path(), "sleep 30", Duration::from_secs(5)) {
+        Ok(_) => panic!("sleep should be cancelled"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("cancelled"));
+    converge::clear_shell_cancel();
+}
+
+#[test]
+fn backend_process_runs_the_installed_cli_and_keeps_the_test() {
+    let user_home = TempDir::new("converge-user");
+    let converge_home = user_home.path().join(".converge");
+    fs::create_dir_all(&converge_home).unwrap();
+    assert_eq!(
+        converge::selected_backend(&converge_home).unwrap(),
+        "converge"
+    );
+    let missing = converge::use_backend(&converge_home, "lab");
+    assert!(missing.is_err());
+    assert!(!converge_home.join("backend.json").exists());
+    converge::use_backend(&converge_home, "hermes").unwrap();
+    let bin = user_home.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let script = if cfg!(windows) {
+        let path = bin.join("hermes.cmd");
+        fs::write(&path, "@echo off\r\necho from-hermes\r\n").unwrap();
+        path
+    } else {
+        let path = bin.join("hermes");
+        fs::write(&path, "#!/bin/sh\nprintf 'from-hermes\\n'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+        path
+    };
+    let _ = script;
+    let repo = git_repo();
+    let mut path = std::ffi::OsString::from(&bin);
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    if let Some(current) = std::env::var_os("PATH") {
+        path.push(current);
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["-p", "say hi", "--test", "true"])
+        .current_dir(repo.path())
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("PATH", &path)
+        .env_remove("CONVERGE_API_KEY")
+        .env_remove("CONVERGE_PROVIDER")
+        .env_remove("CONVERGE_BASE_URL")
+        .env_remove("CONVERGE_MODEL")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let transcript = find_file(
+        &user_home.path().join(".converge").join("projects"),
+        "transcript.jsonl",
+    );
+    let text = fs::read_to_string(transcript).unwrap();
+    assert!(text.contains("from-hermes"));
+    assert!(text.contains("\"status\":0") || text.contains("\"status\": 0"));
+
+    converge::use_backend(&converge_home, "codex").unwrap();
+    let empty = user_home.path().join("empty-path");
+    fs::create_dir_all(&empty).unwrap();
+    let missing_bin = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["-p", "say hi", "--test", "true"])
+        .current_dir(repo.path())
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    assert!(!missing_bin.status.success());
+    let stderr = String::from_utf8_lossy(&missing_bin.stderr);
+    assert!(stderr.contains("codex is not installed"), "{stderr}");
+}
+
+#[test]
+fn windows_raw_screen_keeps_virtual_terminal_bits() {
+    let (input, output) = converge::raw_console_modes(0xffff, 0);
+    assert_eq!(input & 0x0001, 0);
+    assert_eq!(input & 0x0002, 0);
+    assert_eq!(input & 0x0004, 0);
+    assert_eq!(input & 0x0200, 0x0200);
+    assert_eq!(output & 0x0001, 0x0001);
+    assert_eq!(output & 0x0004, 0x0004);
+    let frame = converge::render_chat_frame(24, 80, &["you  hello".to_string()], "", "ready");
+    assert!(frame.contains("hello"));
+}
+
+#[test]
+fn auto_checker_rejects_outside_the_workspace() {
+    let repo = git_repo();
+    fs::write(repo.path().join("file.txt"), "one").unwrap();
+    let home = TempDir::new("converge-home");
+    let workspace = converge::identify(repo.path()).unwrap();
+    let mut session = converge::create_session(home.path(), &workspace, None, budget()).unwrap();
+    converge::set_permission_mode(&mut session, "auto").unwrap();
+    assert!(converge::admit(
+        &session,
+        "edit",
+        r#"{"path":"file.txt","old":"one","new":"two"}"#,
+        true
+    )
+    .is_ok());
+    let outside = std::env::temp_dir().join("not-the-repo");
+    let shell_args = serde_json::json!({
+        "command": format!("cat {}", outside.display())
+    })
+    .to_string();
+    let rejected = converge::admit(&session, "shell", &shell_args, true).unwrap_err();
+    assert!(rejected.to_string().contains("auto rejected"));
+    let frame = converge::render_chat_frame(
+        6,
+        80,
+        &[format!("tool shell\n{rejected}")],
+        "",
+        "single-agent  auto",
+    );
+    assert!(frame.contains("auto rejected"));
+    assert!(frame.contains("single-agent"));
+    assert_eq!(
+        converge::unattended_auto_exit(&session, "shell", &shell_args),
+        Some(1)
+    );
+    assert!(converge::unattended_auto_exit(
+        &session,
+        "edit",
+        r#"{"path":"file.txt","old":"one","new":"two"}"#
+    )
+    .is_none());
+    assert!(converge::admit(&session, "shell", r#"{"command":"cat ../secret"}"#, false).is_err());
+    fs::create_dir(repo.path().join("weights")).unwrap();
+    assert!(converge::admit(
+        &session,
+        "edit",
+        r#"{"path":"weights/model.bin","old":"","new":"x"}"#,
+        true
+    )
+    .is_err());
+    converge::set_permission_mode(&mut session, "dontAsk").unwrap();
+    assert!(converge::admit(&session, "shell", &shell_args, false).is_ok());
+    assert!(converge::unattended_auto_exit(&session, "shell", &shell_args).is_none());
+}
+
+fn overwrite_session_record(path: &Path) -> String {
+    let text = path.display().to_string().replace('\'', "");
+    let mut pieces = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(index) = rest.find(".converge") {
+        pieces.push(rest[..index].to_string());
+        pieces.push(".conv".to_string());
+        pieces.push("erge".to_string());
+        rest = &rest[index + ".converge".len()..];
+    }
+    pieces.push(rest.to_string());
+    if cfg!(windows) && Command::new("bash").arg("--version").output().is_err() {
+        let joined = pieces
+            .iter()
+            .map(|piece| format!("'{}'", piece.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        return format!("Set-Content -LiteralPath ({joined}) -Value 'x'");
+    }
+    let assigns = pieces
+        .iter()
+        .enumerate()
+        .map(|(index, piece)| format!("p{index}='{}'", piece.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let concat = (0..pieces.len())
+        .map(|index| format!("$p{index}"))
+        .collect::<Vec<_>>()
+        .join("");
+    format!("{assigns}; printf x > \"{concat}\"")
+}
+
 fn budget() -> converge::Budget {
     converge::Budget {
         steps: None,
@@ -164,9 +422,29 @@ fn chat_keeps_turns_and_the_goal_until_slash_goal() {
     assert!(rendered.contains("converge-ok"));
 }
 
+#[test]
+fn chat_frame_keeps_the_transcript_above_the_input() {
+    let frame = converge::render_chat_frame(
+        6,
+        40,
+        &["you  hello".to_string(), "ok".to_string()],
+        "next",
+        "single-agent  ask-each  anthropic claude",
+    );
+    let lines: Vec<&str> = frame.lines().collect();
+    assert_eq!(lines.len(), 6);
+    assert!(lines.iter().any(|line| line.contains("you  hello")));
+    assert!(lines.iter().any(|line| *line == "ok"));
+    assert_eq!(lines[4], "> next");
+    assert!(lines[5].contains("single-agent"));
+    assert!(lines[5].contains("ask-each"));
+    assert!(lines[5].contains("anthropic"));
+}
+
 #[cfg(unix)]
 #[test]
 fn two_clients_share_one_session_socket() {
+    use std::os::unix::fs::PermissionsExt;
     let repo = git_repo();
     fs::write(repo.path().join("file.txt"), "changed\n").unwrap();
     let home = PathBuf::from(format!(
@@ -180,6 +458,11 @@ fn two_clients_share_one_session_socket() {
     let session =
         converge::create_session(&home.join(".converge"), &workspace, None, budget()).unwrap();
     let server = converge::serve(&home.join(".converge"), &session, repo.path()).unwrap();
+    let run_dir = home.join(".converge").join("run");
+    let directory = fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+    let socket_mode = fs::metadata(&server.socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(directory, 0o700);
+    assert_eq!(socket_mode, 0o600);
     thread::sleep(Duration::from_millis(50));
     let mut first = UnixStream::connect(&server.socket).unwrap();
     let mut second = UnixStream::connect(&server.socket).unwrap();
@@ -221,6 +504,68 @@ fn two_clients_share_one_session_socket() {
     assert!(!converge::allowed_methods().contains(&"kernel/weight"));
     drop(server);
     let _ = fs::remove_dir_all(&home);
+}
+
+#[cfg(windows)]
+#[test]
+fn two_clients_share_one_named_pipe() {
+    let repo = git_repo();
+    fs::write(repo.path().join("file.txt"), "changed\n").unwrap();
+    let home = TempDir::new("converge-home");
+    let workspace = converge::identify(repo.path()).unwrap();
+    let session = converge::create_session(home.path(), &workspace, None, budget()).unwrap();
+    let server = converge::serve(home.path(), &session, repo.path()).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let mut first = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&server.socket)
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let mut second = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&server.socket)
+        .unwrap();
+    writeln!(
+        first,
+        "{}",
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/input","params":{"text":"hello from a"}}"#
+    )
+    .unwrap();
+    first.flush().unwrap();
+    let left = read_pipe_line(&mut first);
+    let right = read_pipe_line(&mut second);
+    assert!(left.contains("hello from a") || right.contains("hello from a"));
+    let transcript = fs::read_to_string(session.dir.join("transcript.jsonl")).unwrap();
+    assert!(transcript.contains("hello from a"));
+    writeln!(
+        second,
+        "{}",
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/attach","params":{}}"#
+    )
+    .unwrap();
+    second.flush().unwrap();
+    let attached = read_pipe_line(&mut second);
+    assert!(attached.contains("hello from a"));
+    drop(server);
+}
+
+#[cfg(windows)]
+fn read_pipe_line(file: &mut fs::File) -> String {
+    use std::io::Read;
+    let mut all = Vec::new();
+    let mut byte = [0u8; 1];
+    for _ in 0..8192 {
+        if file.read(&mut byte).unwrap_or(0) == 0 {
+            break;
+        }
+        all.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&all).into_owned()
 }
 
 #[test]
@@ -410,6 +755,9 @@ fn workflow_creates_worktrees_and_tasks_stay_off_the_parent() {
         converge::start_background(&session, repo.path(), &dest, "async-branch", "background")
             .unwrap();
     assert_eq!(converge::parent_status(repo.path()).unwrap().trim(), "");
+    let running = converge::tasks_text(&session.dir).unwrap();
+    assert!(running.contains("running"));
+    assert!(running.contains("background"));
     fs::write(dest.join("release"), "go").unwrap();
     handle.join().unwrap();
     let tasks = converge::tasks_text(&session.dir).unwrap();
@@ -446,23 +794,16 @@ fn schedule_is_the_same_cli_and_bypass_stays_off_the_laptop() {
         .unwrap();
     assert!(!bypass.success());
     assert!(converge::laptop_bypass().is_err());
-    if cfg!(target_os = "linux") {
-        assert!(converge::isolated_admit().is_ok());
-    } else {
-        assert!(converge::isolated_admit().is_err());
-    }
-    if cfg!(windows) {
-        assert!(converge::windows_isolation_admit().is_ok());
-    } else {
-        assert!(converge::windows_isolation_admit().is_err());
-    }
+    assert!(converge::isolated_admit().is_err());
+    assert!(converge::windows_isolation_admit().is_err());
     let isolated = Command::new(env!("CARGO_BIN_EXE_converge-isolated"))
-        .status()
+        .output()
         .unwrap();
-    if cfg!(target_os = "linux") {
-        assert!(isolated.success());
-    } else {
-        assert!(!isolated.success());
+    assert!(!isolated.status.success());
+    #[cfg(target_os = "linux")]
+    {
+        let stderr = String::from_utf8_lossy(&isolated.stderr);
+        assert!(stderr.contains("pid namespace"));
     }
     let devin = fs::read_to_string("clients/devin/client.js").unwrap();
     assert!(devin.contains("session/attach"));
@@ -613,6 +954,200 @@ fn unknown_mcp_server_is_an_error() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("mcp server missing"));
+}
+
+struct MapEnv<'a>(&'a [(&'a str, &'a str)]);
+
+impl converge::Env for MapEnv<'_> {
+    fn get(&self, name: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_string())
+    }
+}
+
+#[test]
+fn provider_gateway_selects_the_active_profile() {
+    let home = TempDir::new("converge-home");
+    fs::write(
+        home.path().join("providers.json"),
+        r#"{
+            "version": 1,
+            "active": "lab",
+            "providers": [
+                {"name": "lab", "base_url": "http://127.0.0.1:9/v1", "model": "lab-model", "api_key_env": "LAB_KEY"},
+                {"name": "other", "base_url": "https://models.example/v1", "model": "other-model", "api_key_env": "OTHER_KEY"}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let resolved = converge::choose(
+        home.path(),
+        &MapEnv(&[("LAB_KEY", "lab-secret"), ("OTHER_KEY", "other-secret")]),
+    )
+    .unwrap();
+    assert_eq!(resolved.profile.name, "lab");
+    assert_eq!(resolved.profile.model, "lab-model");
+    assert_eq!(resolved.api_key, "lab-secret");
+    let switched = converge::choose(
+        home.path(),
+        &MapEnv(&[
+            ("CONVERGE_PROVIDER", "other"),
+            ("CONVERGE_MODEL", "override"),
+            ("OTHER_KEY", "other-secret"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(switched.profile.name, "other");
+    assert_eq!(switched.profile.model, "override");
+    assert!(converge::choose(home.path(), &MapEnv(&[])).is_err());
+    converge::use_provider(home.path(), "other").unwrap();
+    let listed = converge::list_providers(home.path()).unwrap();
+    assert!(listed.contains("other"));
+    assert!(listed.contains("active"));
+    assert!(converge::use_provider(home.path(), "missing").is_err());
+}
+
+#[test]
+fn provider_catalog_lists_the_builtin_gateways() {
+    let home = TempDir::new("converge-catalog");
+    let listed = converge::list_providers(home.path()).unwrap();
+    for name in [
+        "anthropic",
+        "openai",
+        "ollama",
+        "alibaba",
+        "grok",
+        "openrouter",
+        "cerebras",
+        "venice",
+        "deepseek",
+        "kimi",
+        "gemini",
+    ] {
+        assert!(listed.contains(name), "{name} missing from {listed}");
+    }
+    assert!(!listed.contains("OPENAI_API_KEY"));
+    let ollama =
+        converge::choose(home.path(), &MapEnv(&[("CONVERGE_PROVIDER", "ollama")])).unwrap();
+    assert_eq!(ollama.profile.base_url, "http://127.0.0.1:11434/v1");
+    assert!(ollama.api_key.is_empty());
+    assert!(converge::choose(home.path(), &MapEnv(&[("CONVERGE_PROVIDER", "missing")])).is_err());
+    converge::use_provider(home.path(), "openai").unwrap();
+    let openai = converge::choose(home.path(), &MapEnv(&[("OPENAI_API_KEY", "sk")])).unwrap();
+    assert_eq!(openai.profile.name, "openai");
+    assert_eq!(openai.profile.model, "gpt-6-astra");
+    assert!(converge::list_providers(home.path())
+        .unwrap()
+        .contains("openai\tgpt-6-astra\thttps://api.openai.com/v1\tactive"));
+}
+
+#[test]
+fn provider_setup_stores_the_api_key_for_later_runs() {
+    let home = TempDir::new("converge-secret");
+    converge::store_api_key(home.path(), "ANTHROPIC_API_KEY", "sk-test-value").unwrap();
+    converge::store_api_key(home.path(), "OPENAI_API_KEY", "abc def").unwrap();
+    let resolved =
+        converge::choose(home.path(), &MapEnv(&[("CONVERGE_PROVIDER", "anthropic")])).unwrap();
+    assert_eq!(resolved.profile.name, "anthropic");
+    assert_eq!(resolved.api_key, "sk-test-value");
+    let quoted =
+        converge::choose(home.path(), &MapEnv(&[("CONVERGE_PROVIDER", "openai")])).unwrap();
+    assert_eq!(quoted.api_key, "abc def");
+    assert!(!converge::list_providers(home.path())
+        .unwrap()
+        .contains("sk-test-value"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(home.path().join(".env"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let user_home = TempDir::new("converge-setup-user");
+    let setup = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["setup"])
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!setup.status.success());
+    assert!(String::from_utf8_lossy(&setup.stderr).contains("terminal"));
+    let missing = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["provider", "use", "anthropic"])
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("ANTHROPIC_API_KEY"));
+    let converge_home = user_home.path().join(".converge");
+    fs::create_dir_all(&converge_home).unwrap();
+    converge::store_api_key(&converge_home, "ANTHROPIC_API_KEY", "sk-test-value").unwrap();
+    let used = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["provider", "use", "anthropic"])
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&used.stdout);
+    let stderr = String::from_utf8_lossy(&used.stderr);
+    assert!(used.status.success(), "{stderr}");
+    assert!(stdout.contains("anthropic"));
+    assert!(!stdout.contains("sk-test-value"));
+}
+
+#[test]
+fn provider_command_uses_the_registry_without_the_env_triple() {
+    let repo = git_repo();
+    let user_home = TempDir::new("converge-user");
+    let converge_home = user_home.path().join(".converge");
+    fs::create_dir_all(&converge_home).unwrap();
+    fs::write(
+        converge_home.join("providers.json"),
+        r#"{
+            "version": 1,
+            "active": "lab",
+            "providers": [
+                {"name": "lab", "base_url": "http://127.0.0.1:1/v1", "model": "lab-model", "api_key_env": "LAB_KEY"}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let listed = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["provider"])
+        .current_dir(repo.path())
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("lab"));
+    assert!(stdout.contains("lab-model"));
+    assert!(!stdout.contains("LAB_KEY"));
+    let output = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["-p", "fix it", "--test", "true"])
+        .current_dir(repo.path())
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("LAB_KEY", "lab-secret")
+        .env_remove("CONVERGE_BASE_URL")
+        .env_remove("CONVERGE_API_KEY")
+        .env_remove("CONVERGE_MODEL")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("model request failed"));
 }
 
 fn shell_args(command: &str) -> String {

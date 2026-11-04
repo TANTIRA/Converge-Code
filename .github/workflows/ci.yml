@@ -9,8 +9,12 @@ on:
 
 jobs:
   ci:
-    name: ci
-    runs-on: ubuntu-latest
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,12 +29,36 @@ jobs:
               exit 1
             fi
           done
-          if [[ -f Cargo.toml ]]; then
-            if ! command -v cargo >/dev/null 2>&1; then
-              curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --component rustfmt
-              # shellcheck source=/dev/null
-              source "${HOME}/.cargo/env"
-            fi
-            cargo fmt --check
-            cargo test
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --component rustfmt
+            # shellcheck source=/dev/null
+            source "${HOME}/.cargo/env"
           fi
+          rustup component add rustfmt
+          cargo fmt --check
+          cargo test
+
+  live:
+    name: live
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Live model call
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CONVERGE_PROVIDER: anthropic
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            echo "skipping live model call"
+            exit 0
+          fi
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y
+            # shellcheck source=/dev/null
+            source "${HOME}/.cargo/env"
+          fi
+          cargo run --quiet --bin converge -- -p "reply with ok" --test true

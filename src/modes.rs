@@ -1,4 +1,5 @@
 use std::fs;
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::session::{self, Session};
@@ -86,10 +87,23 @@ pub fn admit(session: &Session, name: &str, arguments: &str, tty: bool) -> Resul
             ));
         }
     }
+    if session.permission_mode == "auto" {
+        crate::checker::allow(&session.workspace, name, arguments)?;
+    }
     if !tty && would_ask(session, name) {
         return Err(Error::new("permission denied without a tty"));
     }
     Ok(())
+}
+
+pub fn unattended_auto_exit(session: &Session, name: &str, arguments: &str) -> Option<i32> {
+    if session.permission_mode != "auto" {
+        return None;
+    }
+    match admit(session, name, arguments, false) {
+        Ok(()) => None,
+        Err(_) => Some(1),
+    }
 }
 
 pub fn run_admitted_shell(session: &Session, command: &str) -> Result<shell::CommandOutput> {
@@ -98,7 +112,42 @@ pub fn run_admitted_shell(session: &Session, command: &str) -> Result<shell::Com
         serde_json::to_string(command).unwrap_or_default()
     );
     admit(session, "shell", &arguments, false)?;
-    shell::run(&session.workspace, command)
+    run_session_shell(session, command)
+}
+
+pub(crate) fn run_session_shell(session: &Session, command: &str) -> Result<shell::CommandOutput> {
+    let path = session.dir.join("session.json");
+    let snapshot = fs::read(&path).ok();
+    let result = shell::run_timeout(&session.workspace, command, shell_timeout(session));
+    if let Some(snapshot) = snapshot {
+        if record_changed(&path, &snapshot) {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(&path, snapshot)
+                .map_err(|error| Error::new(format!("write {}: {error}", path.display())))?;
+            return Err(Error::new("the shell cannot change the session goal"));
+        }
+    }
+    result
+}
+
+fn shell_timeout(session: &Session) -> Duration {
+    match session.budget.seconds {
+        Some(limit) => Duration::from_secs(limit.saturating_sub(session.used.seconds)),
+        None => shell::DEFAULT_TIMEOUT,
+    }
+}
+
+fn record_changed(path: &std::path::Path, snapshot: &[u8]) -> bool {
+    match fs::read(path) {
+        Ok(now) => now != snapshot,
+        Err(_) => true,
+    }
+}
+
+pub fn asks(session: &Session, name: &str) -> bool {
+    would_ask(session, name)
 }
 
 fn would_ask(session: &Session, name: &str) -> bool {

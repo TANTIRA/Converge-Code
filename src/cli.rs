@@ -19,6 +19,11 @@ pub enum Invocation {
     Schedule(Args),
     Trigger(Args),
     MmdpPut(String),
+    ProviderList,
+    ProviderUse(String),
+    Setup,
+    BackendShow,
+    BackendUse(String),
 }
 
 impl Invocation {
@@ -43,6 +48,17 @@ impl Invocation {
                 )),
             },
             "tasks" => Ok(Self::Tasks),
+            "setup" => Ok(Self::Setup),
+            "provider" => match args.get(1).map(String::as_str) {
+                None | Some("list") => Ok(Self::ProviderList),
+                Some("use") => Ok(Self::ProviderUse(required(&args, 2, "provider")?)),
+                _ => Err(Error::new("usage: converge provider [list | use <name>]")),
+            },
+            "backend" => match args.get(1).map(String::as_str) {
+                None | Some("show") => Ok(Self::BackendShow),
+                Some("use") => Ok(Self::BackendUse(required(&args, 2, "backend")?)),
+                _ => Err(Error::new("usage: converge backend [show | use <name>]")),
+            },
             "schedule" => Ok(Self::Schedule(parse_print(&args[1..])?)),
             "trigger" => Ok(Self::Trigger(parse_print(&args[1..])?)),
             "mmdp" => {

@@ -41,3 +41,7 @@ Instructions for coding agents working in this repository. This file is not the 
 - Do not add comments that restate the code. Comment only to explain a non-obvious constraint.
 - Do not leave dead code.
 - Do not hardcode secrets, environment-specific paths, hosts, or values that belong in configuration.
+
+## Learned User Preferences
+
+- Provider setup prompts for the API key in the terminal and stores it for later runs. The user should not have to export the key in the shell.

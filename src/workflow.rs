@@ -130,13 +130,37 @@ fn run_steps(
             }
             "parallel" => {
                 let children = step
-                    .get_mut("children")
-                    .and_then(Value::as_array_mut)
+                    .get("children")
+                    .and_then(Value::as_array)
                     .ok_or_else(|| Error::new("parallel requires children"))?;
                 if children.len() < 2 {
                     return Err(Error::new("parallel creates more than one worktree"));
                 }
-                run_steps(repo, session_dir, children, order)?;
+                let mut handles = Vec::new();
+                for child in children.clone() {
+                    let repo = repo.to_path_buf();
+                    let session_dir = session_dir.to_path_buf();
+                    handles.push(thread::spawn(move || {
+                        let mut child = child;
+                        let mut child_order = Vec::new();
+                        run_steps(
+                            &repo,
+                            &session_dir,
+                            std::slice::from_mut(&mut child),
+                            &mut child_order,
+                        )?;
+                        Ok::<_, Error>((child, child_order))
+                    }));
+                }
+                let mut merged = Vec::new();
+                for handle in handles {
+                    let (child, child_order) = handle
+                        .join()
+                        .map_err(|_| Error::new("parallel child failed"))??;
+                    merged.push(child);
+                    order.extend(child_order);
+                }
+                step["children"] = json!(merged);
                 step["status"] = json!("done");
             }
             "pipeline" => {
