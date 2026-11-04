@@ -4,7 +4,7 @@ Converge is a Rust CLI for agentic coding on a git repo: one session, multiple m
 
 ## Status
 
-`converge -p <prompt> --test <command>` runs one session and finishes only when the test command exits 0. On a terminal, `converge` opens the chat screen. Piped stdin stays a line protocol. `converge setup` asks for a provider and stores the API key for later runs.
+`converge -p <prompt> --test <command>` runs one session and finishes only when the test command exits 0. On a terminal, `converge` opens the chat screen. Piped stdin stays a line protocol. `converge setup` asks for a provider and stores the API key for later runs. The VS Code and Cursor client is `clients/vscode`. The JetBrains client is `clients/jetbrains`. Both attach to the session socket and do not call the model.
 
 Install the binary with:
 

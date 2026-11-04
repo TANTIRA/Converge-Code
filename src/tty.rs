@@ -73,6 +73,14 @@ pub fn run_chat(cwd: &Path) -> Result<i32> {
     if session.permission_mode == "dontAsk" {
         session::set_permission_mode(&mut session, "ask-each")?;
     }
+    let _clients = crate::uhp::serve(&converge_home, &session, &workspace.toplevel)?;
+    crate::uhp::publish(
+        "session/status",
+        serde_json::json!({
+            "work_mode": session.work_mode,
+            "permission_mode": session.permission_mode,
+        }),
+    );
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     #[cfg(unix)]
@@ -98,6 +106,13 @@ pub fn run_chat(cwd: &Path) -> Result<i32> {
         if line == "\u{1b}[Z" {
             let next = modes::cycle_permission(&session.permission_mode);
             session::set_permission_mode(&mut session, next)?;
+            crate::uhp::publish(
+                "session/status",
+                serde_json::json!({
+                    "work_mode": session.work_mode,
+                    "permission_mode": session.permission_mode,
+                }),
+            );
             writeln!(stdout, "{next}").map_err(|error| Error::new(error.to_string()))?;
             continue;
         }
@@ -117,9 +132,14 @@ pub fn run_chat(cwd: &Path) -> Result<i32> {
             continue;
         }
         if crate::backend::selected(&converge_home)? != "converge" {
-            session::append(&session, &serde_json::json!({"kind": "user", "text": line}))?;
+            session::append(
+                &session,
+                &serde_json::json!({"kind": "user", "text": &line}),
+            )?;
+            crate::uhp::publish("session/stream", serde_json::json!({"text": &line}));
             let text = crate::backend::reply(&converge_home, &workspace.toplevel, &line)?;
             writeln!(stdout, "{text}").map_err(|error| Error::new(error.to_string()))?;
+            crate::uhp::publish("session/stream", serde_json::json!({"text": &text}));
             let message = serde_json::json!({"role": "assistant", "content": text});
             session::append(
                 &session,
@@ -129,7 +149,11 @@ pub fn run_chat(cwd: &Path) -> Result<i32> {
         }
         let rendered = format_turn(&line, None, None);
         write!(stdout, "{rendered}").map_err(|error| Error::new(error.to_string()))?;
-        session::append(&session, &serde_json::json!({"kind": "user", "text": line}))?;
+        session::append(
+            &session,
+            &serde_json::json!({"kind": "user", "text": &line}),
+        )?;
+        crate::uhp::publish("session/stream", serde_json::json!({"text": line}));
     }
     Ok(0)
 }
@@ -218,18 +242,41 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
     extend_messages(&mut messages, &session);
     let mut input = String::new();
     let mut model = crate::model::OpenAiCompatible::open(home).ok();
+    let mut dirty = true;
     loop {
         if CANCEL.swap(false, Ordering::SeqCst) {
             return Ok(130);
         }
-        let status = status_line(&session, home, model.is_some());
-        paint(&render_chat_frame(
-            window_size().0,
-            window_size().1,
-            &view,
-            &input,
-            &status,
-        ))?;
+        if dirty {
+            let status = status_line(&session, home, model.is_some());
+            paint(&render_chat_frame(
+                window_size().0,
+                window_size().1,
+                &view,
+                &input,
+                &status,
+            ))?;
+            dirty = false;
+        }
+        if let Some(line) = crate::uhp::poll_input() {
+            dirty = true;
+            if let Some(code) = submit_line(
+                &mut session,
+                home,
+                &mut model,
+                &mut messages,
+                &mut view,
+                line,
+                true,
+            )? {
+                return Ok(code);
+            }
+            continue;
+        }
+        if !poll_stdin(50)? {
+            continue;
+        }
+        dirty = true;
         match read_key()? {
             Key::Char(ch) => input.push(ch),
             Key::Backspace => {
@@ -239,6 +286,13 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
             Key::ShiftTab => {
                 let next = modes::cycle_permission(&session.permission_mode);
                 session::set_permission_mode(&mut session, next)?;
+                crate::uhp::publish(
+                    "session/status",
+                    serde_json::json!({
+                        "work_mode": session.work_mode,
+                        "permission_mode": session.permission_mode,
+                    }),
+                );
             }
             Key::CtrlC => return Ok(130),
             Key::CtrlD => {
@@ -248,31 +302,64 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
             }
             Key::Enter => {
                 let line = std::mem::take(&mut input);
-                if line == "/quit" {
-                    return Ok(0);
-                }
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some(shown) = command_line(&mut session, &line)? {
-                    view.push(shown);
-                    continue;
-                }
-                view.push(format!("you  {line}"));
-                session::append(&session, &serde_json::json!({"kind": "user", "text": line}))?;
-                messages.push(serde_json::json!({"role": "user", "content": line}));
-                let reply = chat_reply(&mut session, home, &mut model, &mut messages, &mut view)?;
-                if reply == 130 {
-                    let exit = CANCEL.swap(false, Ordering::SeqCst);
-                    crate::shell::clear_stop();
-                    if exit {
-                        return Ok(130);
-                    }
-                    continue;
+                if let Some(code) = submit_line(
+                    &mut session,
+                    home,
+                    &mut model,
+                    &mut messages,
+                    &mut view,
+                    line,
+                    false,
+                )? {
+                    return Ok(code);
                 }
             }
         }
     }
+}
+
+fn submit_line(
+    session: &mut Session,
+    home: &Path,
+    model: &mut Option<crate::model::OpenAiCompatible>,
+    messages: &mut Vec<serde_json::Value>,
+    view: &mut Vec<String>,
+    line: String,
+    recorded: bool,
+) -> Result<Option<i32>> {
+    if line == "/quit" {
+        return Ok(Some(0));
+    }
+    if line.is_empty() {
+        return Ok(None);
+    }
+    if let Some(shown) = command_line(session, &line)? {
+        view.push(shown.clone());
+        crate::uhp::publish(
+            "session/status",
+            serde_json::json!({
+                "work_mode": session.work_mode,
+                "permission_mode": session.permission_mode,
+                "text": shown,
+            }),
+        );
+        return Ok(None);
+    }
+    view.push(format!("you  {line}"));
+    if !recorded {
+        session::append(session, &serde_json::json!({"kind": "user", "text": &line}))?;
+        crate::uhp::publish("session/stream", serde_json::json!({"text": &line}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": line}));
+    let reply = chat_reply(session, home, model, messages, view)?;
+    if reply == 130 {
+        let exit = CANCEL.swap(false, Ordering::SeqCst);
+        crate::shell::clear_stop();
+        if exit {
+            return Ok(Some(130));
+        }
+    }
+    Ok(None)
 }
 
 fn command_line(session: &mut Session, line: &str) -> Result<Option<String>> {
@@ -486,6 +573,7 @@ fn chat_reply(
         let prompt = last_user_text(messages);
         let text = crate::backend::reply(home, &session.workspace, &prompt)?;
         view.push(text.clone());
+        crate::uhp::publish("session/stream", serde_json::json!({"text": &text}));
         let message = serde_json::json!({"role": "assistant", "content": text});
         messages.push(message.clone());
         session::append(
@@ -564,7 +652,8 @@ fn chat_reply(
                 .unwrap_or(&serde_json::Value::Null),
         );
         if !content.is_empty() {
-            view.push(content);
+            view.push(content.clone());
+            crate::uhp::publish("session/stream", serde_json::json!({"text": content}));
         }
         if turn.tool_calls.is_empty() {
             return Ok(0);
@@ -575,6 +664,10 @@ fn chat_reply(
                 if !allowed {
                     let text = format!("{} denied", call.name);
                     view.push(text.clone());
+                    crate::uhp::publish(
+                        "session/tool",
+                        serde_json::json!({"name": call.name, "text": &text}),
+                    );
                     messages.push(serde_json::json!({
                         "role": "tool",
                         "tool_call_id": call.id,
@@ -590,6 +683,13 @@ fn chat_reply(
             let result =
                 watching(|| crate::run::dispatch(session, &call.name, &call.arguments, true));
             view.push(format!("tool {}\n{result}", call.name));
+            crate::uhp::publish(
+                "session/tool",
+                serde_json::json!({"name": call.name, "text": &result}),
+            );
+            if call.name == "edit" {
+                crate::uhp::publish_diff(&session.workspace);
+            }
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -609,17 +709,29 @@ fn confirm_tool(
     session: &Session,
     home: &Path,
 ) -> Result<bool> {
+    crate::uhp::publish_focused("permission/ask", serde_json::json!({"name": name}));
     let prompt = format!("allow {name}? [y/n] ");
     let mut answer = String::new();
+    let mut dirty = true;
     loop {
-        let (rows, cols) = window_size();
-        paint(&render_chat_frame(
-            rows,
-            cols,
-            view,
-            &format!("{prompt}{answer}"),
-            &status_line(session, home, true),
-        ))?;
+        if let Some(allow) = crate::uhp::poll_permission() {
+            return Ok(allow);
+        }
+        if dirty {
+            let (rows, cols) = window_size();
+            paint(&render_chat_frame(
+                rows,
+                cols,
+                view,
+                &format!("{prompt}{answer}"),
+                &status_line(session, home, true),
+            ))?;
+            dirty = false;
+        }
+        if !wait_key(50)? {
+            continue;
+        }
+        dirty = true;
         match read_key()? {
             Key::Char('y') | Key::Char('Y') => return Ok(true),
             Key::Char('n') | Key::Char('N') | Key::Esc => return Ok(false),
@@ -703,6 +815,17 @@ fn read_escape() -> Result<Key> {
         Ok(Key::ShiftTab)
     } else {
         Ok(Key::Esc)
+    }
+}
+
+fn wait_key(timeout_ms: i32) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        poll_stdin(timeout_ms)
+    }
+    #[cfg(windows)]
+    {
+        Ok(windows_screen::pending(timeout_ms as u32))
     }
 }
 
@@ -1022,13 +1145,36 @@ mod windows_screen {
         extend_messages(&mut messages, &session);
         let mut input = String::new();
         let mut model = crate::model::OpenAiCompatible::open(home).ok();
+        let mut dirty = true;
         loop {
             if CANCEL.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 return Ok(130);
             }
-            let status = status_line(&session, home, model.is_some());
-            let (rows, cols) = window_size();
-            paint(&render_chat_frame(rows, cols, &view, &input, &status))?;
+            if dirty {
+                let status = status_line(&session, home, model.is_some());
+                let (rows, cols) = window_size();
+                paint(&render_chat_frame(rows, cols, &view, &input, &status))?;
+                dirty = false;
+            }
+            if let Some(line) = crate::uhp::poll_input() {
+                dirty = true;
+                if let Some(code) = super::submit_line(
+                    &mut session,
+                    home,
+                    &mut model,
+                    &mut messages,
+                    &mut view,
+                    line,
+                    true,
+                )? {
+                    return Ok(code);
+                }
+                continue;
+            }
+            if !pending(50) {
+                continue;
+            }
+            dirty = true;
             match read_key()? {
                 Key::Char(ch) => input.push(ch),
                 Key::Backspace => {
@@ -1038,6 +1184,13 @@ mod windows_screen {
                 Key::ShiftTab => {
                     let next = crate::modes::cycle_permission(&session.permission_mode);
                     session::set_permission_mode(&mut session, next)?;
+                    crate::uhp::publish(
+                        "session/status",
+                        serde_json::json!({
+                            "work_mode": session.work_mode,
+                            "permission_mode": session.permission_mode,
+                        }),
+                    );
                 }
                 Key::CtrlC => return Ok(130),
                 Key::CtrlD => {
@@ -1047,28 +1200,16 @@ mod windows_screen {
                 }
                 Key::Enter => {
                     let line = std::mem::take(&mut input);
-                    if line == "/quit" {
-                        return Ok(0);
-                    }
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Some(shown) = command_line(&mut session, &line)? {
-                        view.push(shown);
-                        continue;
-                    }
-                    view.push(format!("you  {line}"));
-                    session::append(&session, &serde_json::json!({"kind": "user", "text": line}))?;
-                    messages.push(serde_json::json!({"role": "user", "content": line}));
-                    let reply =
-                        chat_reply(&mut session, home, &mut model, &mut messages, &mut view)?;
-                    if reply == 130 {
-                        let exit = CANCEL.swap(false, std::sync::atomic::Ordering::SeqCst);
-                        crate::shell::clear_stop();
-                        if exit {
-                            return Ok(130);
-                        }
-                        continue;
+                    if let Some(code) = super::submit_line(
+                        &mut session,
+                        home,
+                        &mut model,
+                        &mut messages,
+                        &mut view,
+                        line,
+                        false,
+                    )? {
+                        return Ok(code);
                     }
                 }
             }
@@ -1144,7 +1285,7 @@ mod windows_screen {
         }
     }
 
-    fn pending(millis: u32) -> bool {
+    pub(super) fn pending(millis: u32) -> bool {
         let input = unsafe { GetStdHandle(STD_INPUT) };
         unsafe { WaitForSingleObject(input, millis) == 0 }
     }

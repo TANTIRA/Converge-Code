@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -9,6 +10,99 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::session::Session;
+
+static CURRENT: Mutex<Option<Arc<Hub>>> = Mutex::new(None);
+
+struct Hub {
+    emit: Box<dyn Fn(&str, bool) + Send + Sync>,
+    focus_on: Box<dyn Fn(u64) + Send + Sync>,
+    inputs: Mutex<VecDeque<String>>,
+    permits: Mutex<VecDeque<bool>>,
+    session_id: String,
+}
+
+impl Hub {
+    fn install(self) -> Arc<Hub> {
+        let hub = Arc::new(self);
+        *CURRENT.lock().expect("uhp") = Some(Arc::clone(&hub));
+        hub
+    }
+
+    fn focus(&self, id: u64) {
+        (self.focus_on)(id);
+    }
+
+    fn raw(&self, line: &str) {
+        (self.emit)(line, false);
+    }
+
+    fn note(&self, method: &str, mut params: Value, focused: bool) {
+        if let Some(object) = params.as_object_mut() {
+            object
+                .entry("session_id")
+                .or_insert_with(|| json!(self.session_id));
+        }
+        let line = json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string();
+        (self.emit)(&line, focused);
+    }
+
+    fn push_input(&self, text: &str) {
+        self.inputs.lock().expect("uhp").push_back(text.to_string());
+    }
+
+    fn push_permit(&self, allow: bool) {
+        self.permits.lock().expect("uhp").push_back(allow);
+    }
+
+    #[cfg(windows)]
+    pub(super) fn new(
+        session_id: String,
+        emit: Box<dyn Fn(&str, bool) + Send + Sync>,
+        focus_on: Box<dyn Fn(u64) + Send + Sync>,
+    ) -> Self {
+        Self {
+            emit,
+            focus_on,
+            inputs: Mutex::new(VecDeque::new()),
+            permits: Mutex::new(VecDeque::new()),
+            session_id,
+        }
+    }
+}
+
+pub(crate) fn publish(method: &str, params: Value) {
+    let Some(hub) = CURRENT.lock().expect("uhp").clone() else {
+        return;
+    };
+    hub.note(method, params, false);
+}
+
+pub(crate) fn publish_focused(method: &str, params: Value) {
+    let Some(hub) = CURRENT.lock().expect("uhp").clone() else {
+        return;
+    };
+    hub.note(method, params, true);
+}
+
+pub(crate) fn publish_diff(repo: &Path) {
+    publish("session/diff", json!({"diff": git_diff(repo)}));
+}
+
+pub(crate) fn poll_input() -> Option<String> {
+    let Some(hub) = CURRENT.lock().expect("uhp").clone() else {
+        return None;
+    };
+    let next = hub.inputs.lock().expect("uhp").pop_front();
+    next
+}
+
+pub(crate) fn poll_permission() -> Option<bool> {
+    let Some(hub) = CURRENT.lock().expect("uhp").clone() else {
+        return None;
+    };
+    let next = hub.permits.lock().expect("uhp").pop_front();
+    next
+}
 
 pub fn endpoint(home: &Path, session_id: &str) -> PathBuf {
     if cfg!(windows) {
@@ -22,10 +116,17 @@ pub struct Server {
     pub socket: PathBuf,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    hub: Option<Arc<Hub>>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
+        if let Some(hub) = &self.hub {
+            let mut current = CURRENT.lock().expect("uhp");
+            if current.as_ref().is_some_and(|live| Arc::ptr_eq(live, hub)) {
+                *current = None;
+            }
+        }
         self.shutdown.store(true, Ordering::SeqCst);
         #[cfg(unix)]
         {
@@ -44,6 +145,10 @@ pub fn serve(home: &Path, session: &Session, repo: &Path) -> Result<Server> {
     let socket = endpoint(home, &session.id);
     #[cfg(unix)]
     {
+        // macOS sockaddr_un holds 104 bytes, including the trailing NUL.
+        if unix_len(&socket) >= 103 {
+            return Ok(Server::idle(socket));
+        }
         if let Some(parent) = socket.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| Error::new(format!("create {}: {error}", parent.display())))?;
@@ -61,8 +166,28 @@ pub fn serve(home: &Path, session: &Session, repo: &Path) -> Result<Server> {
         let session_dir = session.dir.clone();
         let session_id = session.id.clone();
         let repo = repo.to_path_buf();
-        let clients: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>> =
+        let clients: Arc<Mutex<Vec<(u64, std::os::unix::net::UnixStream)>>> =
             Arc::new(Mutex::new(Vec::new()));
+        let focused: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let ids = Arc::new(AtomicU64::new(1));
+        let hub = Hub {
+            emit: {
+                let clients = Arc::clone(&clients);
+                let focused = Arc::clone(&focused);
+                Box::new(move |line, only| emit_unix(&clients, &focused, line, only))
+            },
+            focus_on: {
+                let focused = Arc::clone(&focused);
+                Box::new(move |id| {
+                    *focused.lock().expect("clients") = Some(id);
+                })
+            },
+            inputs: Mutex::new(VecDeque::new()),
+            permits: Mutex::new(VecDeque::new()),
+            session_id: session_id.clone(),
+        };
+        let hub = hub.install();
+        let live = Arc::clone(&hub);
         let thread = thread::spawn(move || {
             while !flag.load(Ordering::SeqCst) {
                 let Ok((stream, _)) = listener.accept() else {
@@ -75,13 +200,14 @@ pub fn serve(home: &Path, session: &Session, repo: &Path) -> Result<Server> {
                 let Ok(writer) = stream.try_clone() else {
                     continue;
                 };
-                clients.lock().expect("clients").push(writer);
-                let clients = Arc::clone(&clients);
+                let id = ids.fetch_add(1, Ordering::Relaxed);
+                clients.lock().expect("clients").push((id, writer));
+                let hub = Arc::clone(&live);
                 let session_dir = session_dir.clone();
                 let session_id = session_id.clone();
                 let repo = repo.clone();
                 thread::spawn(move || {
-                    let _ = reader(stream, &clients, &session_dir, &session_id, &repo);
+                    let _ = reader(stream, &hub, id, &session_dir, &session_id, &repo);
                 });
             }
         });
@@ -89,6 +215,7 @@ pub fn serve(home: &Path, session: &Session, repo: &Path) -> Result<Server> {
             socket,
             shutdown,
             thread: Some(thread),
+            hub: Some(hub),
         });
     }
     #[cfg(windows)]
@@ -120,9 +247,39 @@ fn private_socket(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn unix_len(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(unix)]
+fn emit_unix(
+    clients: &Mutex<Vec<(u64, std::os::unix::net::UnixStream)>>,
+    focused: &Mutex<Option<u64>>,
+    line: &str,
+    only_focused: bool,
+) {
+    let target = focused.lock().expect("clients").clone();
+    let streams = {
+        let guard = clients.lock().expect("clients");
+        guard
+            .iter()
+            .filter(|(id, _)| !only_focused || target == Some(*id))
+            .filter_map(|(_, stream)| stream.try_clone().ok())
+            .collect::<Vec<_>>()
+    };
+    let payload = format!("{line}\n");
+    for mut stream in streams {
+        let _ = stream.write_all(payload.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+#[cfg(unix)]
 fn reader(
     stream: std::os::unix::net::UnixStream,
-    clients: &Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    hub: &Arc<Hub>,
+    id: u64,
     session_dir: &Path,
     session_id: &str,
     repo: &Path,
@@ -137,28 +294,40 @@ fn reader(
     {
         let trimmed = line.trim();
         if let Ok(request) = serde_json::from_str::<Value>(trimmed) {
+            hub.focus(id);
             let response = dispatch_rpc(&request, session_dir, session_id, repo);
-            if request.get("method").and_then(Value::as_str) == Some("session/input") {
-                let text = request
-                    .pointer("/params/text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let note =
-                    json!({"jsonrpc":"2.0","method":"session/stream","params":{"text": text}});
-                broadcast(clients, &note.to_string());
-            }
-            broadcast(clients, &response);
+            deliver(hub, &request);
+            hub.raw(&response);
         }
         line.clear();
     }
     Ok(())
 }
 
+fn deliver(hub: &Hub, request: &Value) {
+    match request.get("method").and_then(Value::as_str) {
+        Some("session/input") => {
+            let text = request
+                .pointer("/params/text")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            hub.push_input(text);
+            hub.note("session/stream", json!({"text": text}), false);
+        }
+        Some("permission/respond") => {
+            if let Some(allow) = request.pointer("/params/allow").and_then(Value::as_bool) {
+                hub.push_permit(allow);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn dispatch_rpc(request: &Value, session_dir: &Path, session_id: &str, repo: &Path) -> String {
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let id = request.get("id").cloned();
     let params = request.get("params").cloned().unwrap_or(json!({}));
-    let result = match method {
+    let mut result = match method {
         "session/attach" => json!({
             "session_id": session_id,
             "transcript": read_transcript(session_dir),
@@ -189,6 +358,11 @@ fn dispatch_rpc(request: &Value, session_dir: &Path, session_id: &str, repo: &Pa
         }
         _ => json!({"error": "unknown method"}),
     };
+    if let Some(object) = result.as_object_mut() {
+        object
+            .entry("session_id")
+            .or_insert_with(|| json!(session_id));
+    }
     let response = if let Some(id) = id {
         json!({"jsonrpc": "2.0", "id": id, "result": result})
     } else {
@@ -208,19 +382,15 @@ fn broadcast_note(session_dir: &Path, note: &Value) {
     }
 }
 
-#[cfg(unix)]
-fn broadcast(clients: &Mutex<Vec<std::os::unix::net::UnixStream>>, line: &str) {
-    let streams = {
-        let guard = clients.lock().expect("clients");
-        guard
-            .iter()
-            .filter_map(|stream| stream.try_clone().ok())
-            .collect::<Vec<_>>()
-    };
-    let payload = format!("{line}\n");
-    for mut stream in streams {
-        let _ = stream.write_all(payload.as_bytes());
-        let _ = stream.flush();
+impl Server {
+    #[cfg(unix)]
+    fn idle(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            shutdown: Arc::new(AtomicBool::new(true)),
+            thread: None,
+            hub: None,
+        }
     }
 }
 
@@ -257,7 +427,7 @@ mod windows_pipe {
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -344,7 +514,25 @@ mod windows_pipe {
         let session_id = session.id.clone();
         let repo = repo.to_path_buf();
         let name = socket.clone();
-        let clients: Arc<Mutex<Vec<PipeHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let clients: Arc<Mutex<Vec<(u64, PipeHandle)>>> = Arc::new(Mutex::new(Vec::new()));
+        let focused: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let ids = Arc::new(AtomicU64::new(1));
+        let hub = super::Hub::new(
+            session_id.clone(),
+            {
+                let clients = Arc::clone(&clients);
+                let focused = Arc::clone(&focused);
+                Box::new(move |line, only| emit_pipe(&clients, &focused, line, only))
+            },
+            {
+                let focused = Arc::clone(&focused);
+                Box::new(move |id| {
+                    *focused.lock().expect("clients") = Some(id);
+                })
+            },
+        )
+        .install();
+        let live = Arc::clone(&hub);
         let thread = thread::spawn(move || {
             let mut ready = Some(first);
             while !flag.load(Ordering::SeqCst) {
@@ -363,14 +551,18 @@ mod windows_pipe {
                     close_pipe(pipe);
                     continue;
                 };
-                clients.lock().expect("clients").push(PipeHandle(writer));
-                let clients = Arc::clone(&clients);
+                let id = ids.fetch_add(1, Ordering::Relaxed);
+                clients
+                    .lock()
+                    .expect("clients")
+                    .push((id, PipeHandle(writer)));
+                let hub = Arc::clone(&live);
                 let session_dir = session_dir.clone();
                 let session_id = session_id.clone();
                 let repo = repo.clone();
                 let pipe = PipeHandle(pipe);
                 thread::spawn(move || {
-                    read_pipe(pipe.0, &clients, &session_dir, &session_id, &repo);
+                    read_pipe(pipe.0, &hub, id, &session_dir, &session_id, &repo);
                     let _ = unsafe { DisconnectNamedPipe(pipe.0) };
                     close_pipe(pipe.0);
                 });
@@ -380,6 +572,7 @@ mod windows_pipe {
             socket,
             shutdown,
             thread: Some(thread),
+            hub: Some(hub),
         })
     }
 
@@ -460,9 +653,27 @@ mod windows_pipe {
         ) -> Bool;
     }
 
+    fn emit_pipe(
+        clients: &Mutex<Vec<(u64, PipeHandle)>>,
+        focused: &Mutex<Option<u64>>,
+        line: &str,
+        only_focused: bool,
+    ) {
+        let target = *focused.lock().expect("clients");
+        let payload = format!("{line}\n");
+        let guard = clients.lock().expect("clients");
+        for (id, handle) in guard.iter() {
+            if only_focused && target != Some(*id) {
+                continue;
+            }
+            let _ = write_handle(handle.0, payload.as_bytes());
+        }
+    }
+
     fn read_pipe(
         pipe: Handle,
-        clients: &Arc<Mutex<Vec<PipeHandle>>>,
+        hub: &Arc<super::Hub>,
+        id: u64,
         session_dir: &Path,
         session_id: &str,
         repo: &Path,
@@ -489,28 +700,12 @@ mod windows_pipe {
                 let text = String::from_utf8_lossy(&line);
                 let trimmed = text.trim();
                 if let Ok(request) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    hub.focus(id);
                     let response = dispatch_rpc(&request, session_dir, session_id, repo);
-                    if request.get("method").and_then(|method| method.as_str())
-                        == Some("session/input")
-                    {
-                        let text = request
-                            .pointer("/params/text")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("");
-                        let note = serde_json::json!({"jsonrpc":"2.0","method":"session/stream","params":{"text": text}});
-                        broadcast(clients, &note.to_string());
-                    }
-                    broadcast(clients, &response);
+                    super::deliver(hub, &request);
+                    hub.raw(&response);
                 }
             }
-        }
-    }
-
-    fn broadcast(clients: &Mutex<Vec<PipeHandle>>, line: &str) {
-        let payload = format!("{line}\n");
-        let guard = clients.lock().expect("clients");
-        for handle in guard.iter() {
-            let _ = write_handle(handle.0, payload.as_bytes());
         }
     }
 

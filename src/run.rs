@@ -68,6 +68,15 @@ pub fn run_print(cwd: &Path, args: &Args) -> Result<i32> {
         }
     }
     session::append(&session, &json!({"kind": "user", "text": args.prompt}))?;
+    let _clients = crate::uhp::serve(&home, &session, &workspace.toplevel)?;
+    crate::uhp::publish(
+        "session/status",
+        json!({
+            "work_mode": session.work_mode,
+            "permission_mode": session.permission_mode,
+        }),
+    );
+    crate::uhp::publish("session/stream", json!({"text": args.prompt}));
     execute(
         &mut model,
         &mut session,
@@ -116,6 +125,14 @@ fn execute(
             session,
             &json!({"kind": "assistant", "message": turn.assistant_message}),
         )?;
+        let spoken = turn
+            .assistant_message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !spoken.is_empty() {
+            crate::uhp::publish("session/stream", json!({"text": spoken}));
+        }
         if over_token_budget(session.budget.tokens, tokens) {
             session::append(session, &json!({"kind": "budget", "exhausted": true}))?;
             return Ok(1);
@@ -170,8 +187,12 @@ fn execute(
             }));
             session::append(
                 session,
-                &json!({"kind": "tool", "name": call.name, "text": result}),
+                &json!({"kind": "tool", "name": call.name, "text": &result}),
             )?;
+            crate::uhp::publish("session/tool", json!({"name": call.name, "text": &result}));
+            if call.name == "edit" {
+                crate::uhp::publish_diff(&session.workspace);
+            }
         }
     }
 }

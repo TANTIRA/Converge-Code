@@ -1,0 +1,7 @@
+<idea-plugin>
+  <id>converge.client</id>
+  <name>Converge</name>
+  <vendor>converge</vendor>
+  <description>JetBrains client for one Converge session. The converge CLI must already be installed. This client only attaches to the UHP socket.</description>
+  <depends>com.intellij.modules.platform</depends>
+</idea-plugin>

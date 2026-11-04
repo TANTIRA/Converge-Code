@@ -506,6 +506,105 @@ fn two_clients_share_one_session_socket() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[cfg(unix)]
+#[test]
+fn editor_client_attaches_to_the_running_chat() {
+    let repo = git_repo();
+    fs::write(repo.path().join("file.txt"), "one\n").unwrap();
+    assert!(commit_all(repo.path(), "first"));
+    fs::write(repo.path().join("file.txt"), "two\n").unwrap();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let home = PathBuf::from(format!("/tmp/c{}ide{n}", std::process::id()));
+    let _clean = RemoveDir(home.clone());
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .arg("chat")
+        .current_dir(repo.path())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let socket = wait_socket(&home);
+    let mut first = UnixStream::connect(&socket).unwrap();
+    let mut second = UnixStream::connect(&socket).unwrap();
+    first
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    let session_id = socket.file_stem().unwrap().to_string_lossy().into_owned();
+    write!(
+        first,
+        "{}\n",
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"session/attach","params":{{"session_id":"{session_id}"}}}}"#
+        )
+    )
+    .unwrap();
+    let attached = read_until(&mut first, &session_id);
+    assert!(attached.contains(&session_id), "{attached}");
+    write!(
+        second,
+        "{}\n",
+        format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"session/input","params":{{"session_id":"{session_id}","text":"from the editor"}}}}"#
+        )
+    )
+    .unwrap();
+    let echoed = read_until(&mut first, "from the editor");
+    assert!(echoed.contains("from the editor"), "{echoed}");
+    let transcript =
+        fs::read_to_string(find_file(&home.join(".converge"), "transcript.jsonl")).unwrap();
+    assert!(transcript.contains("from the editor"));
+    write!(
+        second,
+        "{}\n",
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"session/diff","params":{{"session_id":"{session_id}"}}}}"#
+        )
+    )
+    .unwrap();
+    let diff = read_until(&mut second, "file.txt");
+    assert!(diff.contains("file.txt"), "{diff}");
+    child.stdin.as_mut().unwrap().write_all(b"/quit\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+}
+
+#[cfg(unix)]
+fn wait_socket(home: &Path) -> PathBuf {
+    let run = home.join(".converge").join("run");
+    for _ in 0..50 {
+        if let Ok(entries) = fs::read_dir(&run) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("sock") {
+                    return path;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("session socket did not appear in {}", run.display());
+}
+
+#[cfg(unix)]
+struct RemoveDir(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RemoveDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn two_clients_share_one_named_pipe() {
@@ -810,9 +909,25 @@ fn schedule_is_the_same_cli_and_bypass_stays_off_the_laptop() {
     assert!(!devin.contains("PromoteWeightEdit"));
     let editor = fs::read_to_string("clients/vscode/extension.js").unwrap();
     assert!(editor.contains("session/attach"));
+    assert!(editor.contains("session/selection"));
+    assert!(editor.contains("permission/respond"));
+    assert!(!editor.contains("PromoteWeightEdit"));
     let jetbrains =
         fs::read_to_string("clients/jetbrains/src/main/kotlin/converge/UhpClient.kt").unwrap();
     assert!(jetbrains.contains("session/attach"));
+    assert!(jetbrains.contains("permission/respond"));
+    let script = format!(
+        "const c = require({}); const line = c.request('session/input', c.withSession('abc', {{text: 'hi'}}), 2); if (!line.includes('abc') || !line.includes('session/input') || !line.endsWith('\\n')) throw new Error(line);",
+        serde_json::to_string(&Path::new(env!("CARGO_MANIFEST_DIR")).join("clients/vscode/extension.js")).unwrap()
+    );
+    match Command::new("node").arg("-e").arg(script).output() {
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("{error}"),
+    }
 }
 
 #[test]
