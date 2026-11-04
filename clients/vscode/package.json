@@ -1,0 +1,14 @@
+{
+  "name": "converge-editor",
+  "displayName": "Converge",
+  "description": "VS Code and Cursor client for one Converge session",
+  "version": "0.1.0",
+  "publisher": "converge",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ]
+}

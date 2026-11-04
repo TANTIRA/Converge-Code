@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Governance files and Rust tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in AGENTS.md SECURITY.md POLICY.md docs/README.md; do
+            if [[ ! -f "$f" ]]; then
+              echo "missing required file: $f" >&2
+              exit 1
+            fi
+          done
+          if [[ -f Cargo.toml ]]; then
+            if ! command -v cargo >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --component rustfmt
+              # shellcheck source=/dev/null
+              source "${HOME}/.cargo/env"
+            fi
+            cargo fmt --check
+            cargo test
+          fi
