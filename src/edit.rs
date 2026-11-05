@@ -100,7 +100,8 @@ fn retry<T>(op: impl Fn() -> std::io::Result<T>, action: &str, path: &Path) -> R
     loop {
         match op() {
             Ok(value) => return Ok(value),
-            Err(error) if is_lock(&error) && attempt + 1 < 8 => {
+            // Thirteen waits add up to about 2.3 seconds, enough for an editor or virus scanner.
+            Err(error) if is_lock(&error) && attempt + 1 < 14 => {
                 attempt += 1;
                 thread::sleep(Duration::from_millis(25 * attempt));
             }
