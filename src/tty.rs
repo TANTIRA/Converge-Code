@@ -158,6 +158,27 @@ fn tasks_reply(session: &Session) -> String {
     crate::workflow::tasks_text(&session.dir).unwrap_or_default()
 }
 
+fn task_reply(session: &Session, rest: &str) -> String {
+    let Some((goal, test)) = rest.split_once(" --test ") else {
+        return "usage: /task <goal> --test <command>".to_string();
+    };
+    let started = std::env::current_exe()
+        .map_err(|error| Error::new(error.to_string()))
+        .and_then(|bin| {
+            crate::workflow::start_background(
+                session,
+                &session.workspace,
+                &bin,
+                goal.trim(),
+                test.trim(),
+            )
+        });
+    match started {
+        Ok(_) => format!("started in the background: {}", goal.trim()),
+        Err(error) => error.message,
+    }
+}
+
 fn plan_reply(session: &mut Session, action: &str) -> Result<String> {
     match action {
         "approve" => modes::approve_plan(session)?,
@@ -351,6 +372,14 @@ fn submit_line(
         );
         return Ok(None);
     }
+    for finished in crate::workflow::take_finished(&session.dir) {
+        view.push(finished.clone());
+        session::append(
+            session,
+            &serde_json::json!({"kind": "user", "text": &finished}),
+        )?;
+        messages.push(serde_json::json!({"role": "user", "content": finished}));
+    }
     view.push(format!("you  {line}"));
     if !recorded {
         session::append(session, &serde_json::json!({"kind": "user", "text": &line}))?;
@@ -374,6 +403,9 @@ fn command_line(session: &mut Session, line: &str) -> Result<Option<String>> {
     }
     if line == "/tasks" {
         return Ok(Some(tasks_reply(session)));
+    }
+    if let Some(rest) = line.strip_prefix("/task ") {
+        return Ok(Some(task_reply(session, rest)));
     }
     if let Some(rest) = line.strip_prefix("/plan ") {
         return plan_reply(session, rest.trim()).map(Some);

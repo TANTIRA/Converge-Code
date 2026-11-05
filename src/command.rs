@@ -38,6 +38,26 @@ pub fn print_tasks(cwd: &Path) -> Result<i32> {
     Ok(0)
 }
 
+pub fn run_workflow_cli(cwd: &Path, test_command: &str) -> Result<i32> {
+    let session = open_session(cwd)?;
+    let bin = std::env::current_exe().map_err(|error| Error::new(error.to_string()))?;
+    if !workflow::execute(&session, &session.workspace, &bin, test_command)? {
+        eprintln!("a workflow child did not pass its completion command");
+        return Ok(1);
+    }
+    let output = crate::modes::run_session_shell(&session, test_command)?;
+    session::append(
+        &session,
+        &serde_json::json!({
+            "kind": "test",
+            "status": output.status,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+        }),
+    )?;
+    Ok(output.status)
+}
+
 pub fn show_backend_cli() -> Result<i32> {
     let home = home::converge_home()?;
     let name = crate::backend::selected(&home)?;

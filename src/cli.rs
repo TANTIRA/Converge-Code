@@ -16,6 +16,7 @@ pub enum Invocation {
     ModeWork(String),
     ModePermission(String),
     Tasks,
+    Workflow(String),
     Schedule(Args),
     Trigger(Args),
     MmdpPut(String),
@@ -48,6 +49,12 @@ impl Invocation {
                 )),
             },
             "tasks" => Ok(Self::Tasks),
+            "workflow" => match (args.get(1).map(String::as_str), args.get(2)) {
+                (Some("--test"), Some(test)) if !test.is_empty() => {
+                    Ok(Self::Workflow(test.clone()))
+                }
+                _ => Err(Error::new("usage: converge workflow --test <command>")),
+            },
             "setup" => Ok(Self::Setup),
             "provider" => match args.get(1).map(String::as_str) {
                 None | Some("list") => Ok(Self::ProviderList),

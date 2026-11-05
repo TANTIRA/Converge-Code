@@ -46,6 +46,10 @@ In ask and plan, the document may be written and is not yet run. Running a workf
 
 A script that was interrupted resumes from `workflow.json` in the session directory on resume.
 
+`converge workflow --test <command>` runs the script. Each `agent` step starts a child session, `converge -p <goal> --test <command>`, in a worktree under `<git common dir>/converge-worktrees/<session_id>/`. A step is `done` only when its child exits with code 0, and otherwise `failed`. A failed `pipeline` step stops the steps after it. After every child passes, the command also runs in the parent.
+
+In a terminal chat, `/task <goal> --test <command>` starts a background task in `multi-task` or `dynamic-workflow`.
+
 ## Single-agent
 
 The single-agent work mode rejects async spawn and rejects running a workflow. An attempt to create a child fails in the kernel, not silently inside the model.

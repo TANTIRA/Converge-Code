@@ -151,3 +151,100 @@ fn keys_that_arrive_together_are_all_read() {
     assert!(status.success());
     let _ = fs::remove_dir_all(&base);
 }
+
+// The background child uses a backend CLI, so this never calls a real model.
+#[test]
+fn a_background_task_runs_a_child_and_reports_on_a_later_turn() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("converge-pty-task-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    let home = base.join("home");
+    let bin = base.join("bin");
+    for dir in [&repo, &home, &bin] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "first"]);
+    converge::use_backend(&home.join(".converge"), "hermes").unwrap();
+    let script = bin.join("hermes");
+    fs::write(&script, "#!/bin/sh\nprintf child > child.txt\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let command = |stdin: Stdio, stdout: Stdio| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_converge"));
+        command
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(Stdio::null());
+        command
+    };
+    assert!(command(Stdio::null(), Stdio::null())
+        .args(["mode", "work", "multi-task"])
+        .status()
+        .unwrap()
+        .success());
+
+    let (mut master, replica) = open_terminal();
+    let mut drain = master.try_clone().unwrap();
+    thread::spawn(move || {
+        let mut sink = [0u8; 4096];
+        while matches!(drain.read(&mut sink), Ok(count) if count > 0) {}
+    });
+    let stdin = Stdio::from(OwnedFd::from(replica.try_clone().unwrap()));
+    let stdout = Stdio::from(OwnedFd::from(replica));
+    let mut chat = command(stdin, stdout).spawn().unwrap();
+    thread::sleep(Duration::from_millis(300));
+
+    master
+        .write_all(b"/task say hi --test test -f child.txt\r")
+        .unwrap();
+    let tasks = || {
+        find(&home, "tasks.json")
+            .and_then(|path| fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    };
+    eventually("the task starts", || tasks().contains("say hi"));
+    let started = Instant::now();
+    while !tasks().contains("\"done\"") {
+        assert!(started.elapsed() < Duration::from_secs(20), "{}", tasks());
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!repo.join("child.txt").exists());
+
+    master.write_all(b"next message\r").unwrap();
+    // The child has its own session, so read the transcript beside the parent's tasks.json.
+    let parent = find(&home, "tasks.json")
+        .unwrap()
+        .with_file_name("transcript.jsonl");
+    eventually("the result enters a later turn", || {
+        fs::read_to_string(&parent)
+            .unwrap_or_default()
+            .contains("Background task task-1 finished with status done")
+    });
+    master.write_all(b"/quit\r").unwrap();
+    let started = Instant::now();
+    while chat.try_wait().unwrap().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(10), "/quit");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = fs::remove_dir_all(&base);
+}

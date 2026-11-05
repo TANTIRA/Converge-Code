@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         Invocation::ModeWork(mode) => converge::set_work_mode_cli(&cwd, &mode),
         Invocation::ModePermission(mode) => converge::set_permission_mode_cli(&cwd, &mode),
         Invocation::Tasks => converge::print_tasks(&cwd),
+        Invocation::Workflow(test) => converge::run_workflow_cli(&cwd, &test),
         Invocation::MmdpPut(name) => converge::mmdp_put_laptop(&cwd, &name),
         Invocation::ProviderList => converge::list_providers_cli(),
         Invocation::ProviderUse(name) => converge::use_provider_cli(&name),

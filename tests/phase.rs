@@ -785,7 +785,7 @@ fn lessons_write_only_after_success_and_revert_keeps_code() {
 }
 
 #[test]
-fn workflow_creates_worktrees_and_tasks_stay_off_the_parent() {
+fn workflow_rejects_bad_documents_and_modes_before_any_child_starts() {
     let repo = git_repo();
     fs::write(repo.path().join("file.txt"), "one").unwrap();
     assert!(commit_all(repo.path(), "first"));
@@ -793,46 +793,37 @@ fn workflow_creates_worktrees_and_tasks_stay_off_the_parent() {
     let workspace = converge::identify(repo.path()).unwrap();
     let mut session =
         converge::create_session(home.path(), &workspace, Some("goal".into()), budget()).unwrap();
+    let bin = Path::new(env!("CARGO_BIN_EXE_converge"));
     assert!(converge::spawn_child(&session, repo.path(), &home.path().join("no"), "nope").is_err());
+    assert!(converge::start_background(&session, repo.path(), bin, "g", "true").is_err());
     fs::write(
         session.dir.join("workflow.json"),
-        r#"{"version":1,"steps":[{"op":"parallel","id":"group","goal":"g","model":null,"worktree":true,"children":[{"op":"agent","id":"alpha","goal":"a","model":null,"worktree":true},{"op":"agent","id":"beta","goal":"b","model":null,"worktree":true}]}]}"#,
+        r#"{"version":1,"steps":[]}"#,
     )
     .unwrap();
     converge::set_work_mode(&mut session, "ask").unwrap();
-    assert!(converge::execute_workflow(&session, repo.path()).is_err());
+    assert!(converge::execute_workflow(&session, repo.path(), bin, "true").is_err());
     converge::set_work_mode(&mut session, "dynamic-workflow").unwrap();
-    converge::execute_workflow(&session, repo.path()).unwrap();
-    assert!(
-        session
-            .dir
-            .join("worktrees")
-            .join("alpha")
-            .join(".git")
-            .exists()
-            || session.dir.join("worktrees").join("alpha").exists()
-    );
-    assert!(session.dir.join("worktrees").join("beta").exists());
+    for steps in [
+        r#"[{"op":"agent","id":"../escape","goal":"g"}]"#,
+        r#"[{"op":"agent","id":"a"}]"#,
+        r#"[{"op":"agent","id":"a","goal":"g","children":[]}]"#,
+        r#"[{"op":"parallel","children":[{"op":"agent","id":"a","goal":"g"}]}]"#,
+        r#"[{"op":"pipeline"}]"#,
+        r#"[{"op":"shell","id":"a","goal":"g"}]"#,
+    ] {
+        fs::write(
+            session.dir.join("workflow.json"),
+            format!(r#"{{"version":1,"steps":{steps}}}"#),
+        )
+        .unwrap();
+        assert!(
+            converge::execute_workflow(&session, repo.path(), bin, "true").is_err(),
+            "{steps}"
+        );
+    }
     assert_eq!(converge::parent_status(repo.path()).unwrap().trim(), "");
-    let log = fs::read_to_string(session.dir.join("workflow.log")).unwrap();
-    assert!(
-        log.find("agent alpha").unwrap() < log.find("agent beta").unwrap()
-            || log.contains("agent alpha")
-    );
-    let dest = home.path().join("async-child");
-    converge::set_work_mode(&mut session, "multi-task").unwrap();
-    let handle =
-        converge::start_background(&session, repo.path(), &dest, "async-branch", "background")
-            .unwrap();
-    assert_eq!(converge::parent_status(repo.path()).unwrap().trim(), "");
-    let running = converge::tasks_text(&session.dir).unwrap();
-    assert!(running.contains("running"));
-    assert!(running.contains("background"));
-    fs::write(dest.join("release"), "go").unwrap();
-    handle.join().unwrap();
-    let tasks = converge::tasks_text(&session.dir).unwrap();
-    assert!(tasks.contains("done"));
-    assert!(tasks.contains("background"));
+    assert_eq!(converge::tasks_text(&session.dir).unwrap(), "");
 }
 
 #[test]

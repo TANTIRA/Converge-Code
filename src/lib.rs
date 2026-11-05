@@ -32,8 +32,8 @@ mod worktree;
 pub use backend::{reply as backend_reply, selected as selected_backend, use_backend};
 pub use cli::{Args, Invocation};
 pub use command::{
-    list_providers_cli, mmdp_put_laptop, print_tasks, set_permission_mode_cli, set_work_mode_cli,
-    setup_cli, show_backend_cli, use_backend_cli, use_provider_cli,
+    list_providers_cli, mmdp_put_laptop, print_tasks, run_workflow_cli, set_permission_mode_cli,
+    set_work_mode_cli, setup_cli, show_backend_cli, use_backend_cli, use_provider_cli,
 };
 pub use edit::apply as edit_file;
 pub use error::{Error, Result};

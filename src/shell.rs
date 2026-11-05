@@ -59,7 +59,7 @@ fn run_invocation(
     prepare(&mut process, cwd);
     remove_provider_keys(&mut process);
     process.args(&prefix).arg(command);
-    finish(&program, process, timeout)
+    finish(&program, process, timeout, true)
 }
 
 pub fn run_argv(
@@ -74,7 +74,25 @@ pub fn run_argv(
     };
     prepare(&mut process, cwd);
     process.args(args);
-    finish(program, process, timeout)
+    finish(program, process, timeout, true)
+}
+
+// A child session needs the provider keys, which only its own model shell then loses.
+pub(crate) fn run_child(
+    cwd: &Path,
+    bin: &Path,
+    args: &[String],
+    model: Option<&str>,
+    timeout: Duration,
+    cancellable: bool,
+) -> Result<CommandOutput> {
+    let mut process = Command::new(bin);
+    prepare(&mut process, cwd);
+    process.args(args);
+    if let Some(model) = model {
+        process.env("CONVERGE_MODEL", model);
+    }
+    finish(&bin.to_string_lossy(), process, timeout, cancellable)
 }
 
 fn prepare(process: &mut Command, cwd: &Path) {
@@ -100,7 +118,12 @@ fn remove_provider_keys(process: &mut Command) {
     }
 }
 
-fn finish(program: &str, mut process: Command, timeout: Duration) -> Result<CommandOutput> {
+fn finish(
+    program: &str,
+    mut process: Command,
+    timeout: Duration,
+    cancellable: bool,
+) -> Result<CommandOutput> {
     if timeout.is_zero() {
         return Err(Error::new("command timed out"));
     }
@@ -115,8 +138,8 @@ fn finish(program: &str, mut process: Command, timeout: Duration) -> Result<Comm
     let stderr = child.stderr.take().map(capture);
     let started = Instant::now();
     let status = loop {
-        if started.elapsed() >= timeout || stop_requested() {
-            let cancelled = stop_requested();
+        let cancelled = cancellable && stop_requested();
+        if started.elapsed() >= timeout || cancelled {
             kill_tree(&mut child);
             let _ = child.wait();
             if cancelled {
