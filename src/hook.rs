@@ -55,7 +55,7 @@ fn lint_command(repo: &Path) -> Result<Option<String>> {
     }
 }
 
-fn git_path(repo: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn git_path(repo: &Path, name: &str) -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--git-path", name])
         .current_dir(repo)

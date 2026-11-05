@@ -120,7 +120,13 @@ pub fn run_admitted_shell(session: &Session, command: &str) -> Result<shell::Com
 pub(crate) fn run_session_shell(session: &Session, command: &str) -> Result<shell::CommandOutput> {
     let path = session.dir.join("session.json");
     let snapshot = fs::read(&path).ok();
-    let result = shell::run_timeout(&session.workspace, command, shell_timeout(session));
+    let protected = crate::sandbox::Protected::for_session(session);
+    let result = shell::run_sandboxed(
+        &session.workspace,
+        command,
+        shell_timeout(session),
+        &protected,
+    );
     if let Some(snapshot) = snapshot {
         if record_changed(&path, &snapshot) {
             if let Some(parent) = path.parent() {
@@ -189,7 +195,7 @@ fn has_shell_syntax(command: &str) -> bool {
     })
 }
 
-// shortcut: these checks read the command text, so a glob or a script can get past them; upgrade to an OS sandbox over ~/.converge and weights/.
+// shortcut: these checks read the command text, so a glob or a script can get past them; they are the only limit where sandbox::available() is false.
 fn shell_targets_session(command: &str) -> bool {
     command.contains(".converge")
 }

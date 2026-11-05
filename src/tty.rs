@@ -239,6 +239,7 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
         Some(&crate::instructions::user_instructions(home)),
     )?;
     let mut view = load_view(&session);
+    view.extend(crate::sandbox::missing_warning().map(str::to_string));
     let mut messages = vec![serde_json::json!({
         "role": "system",
         "content": chat_prompt(&instructions, session.goal.as_deref()),

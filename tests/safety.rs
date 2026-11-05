@@ -481,3 +481,85 @@ fn a_client_that_stops_reading_does_not_stall_the_others() {
     drop(server);
     let _ = fs::remove_dir_all(&base);
 }
+
+#[cfg(unix)]
+#[test]
+fn sandbox_keeps_commands_out_of_secrets_weights_hooks_and_the_socket() {
+    if !converge::sandbox_available() {
+        assert!(
+            std::env::var_os("CONVERGE_EXPECT_SANDBOX").is_none(),
+            "this CI job must have a sandbox"
+        );
+        return;
+    }
+    let repo = git_repo();
+    fs::create_dir(repo.path().join("weights")).unwrap();
+    fs::write(repo.path().join("weights/m.bin"), "weights").unwrap();
+    // Short, because a socket path has a low length limit.
+    let base = PathBuf::from(format!("/tmp/cvb{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let base = base.canonicalize().unwrap();
+    let home = base.join(".converge");
+    let workspace = converge::identify(repo.path()).unwrap();
+    let session = converge::create_session(&home, &workspace, None, budget()).unwrap();
+    fs::write(home.join(".env"), "KEY=sk-secret\n").unwrap();
+    let server = converge::serve(&home, &session, repo.path()).unwrap();
+    assert!(server.socket.exists());
+    // Split, so these reach the sandbox rather than stop at the text check.
+    let split = format!("p='{}/.conv'; q='erge'", base.display());
+
+    let secret =
+        converge::run_admitted_shell(&session, &format!("{split}; cat \"$p$q/.env\"")).unwrap();
+    assert_ne!(secret.status, 0);
+    assert!(!secret.stdout.contains("sk-secret"));
+
+    let socket = server.socket.file_name().unwrap().to_string_lossy();
+    let connect = format!(
+        "{split}; python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \"$p$q/run/{socket}\""
+    );
+    assert_ne!(
+        converge::run_admitted_shell(&session, &connect)
+            .unwrap()
+            .status,
+        0
+    );
+
+    let weights = converge::run_admitted_shell(&session, "cd wei*s; rm m.bin").unwrap();
+    assert_ne!(weights.status, 0);
+    assert!(repo.path().join("weights/m.bin").exists());
+
+    let hook =
+        converge::run_admitted_shell(&session, "cd .git/hooks; echo x > pre-commit").unwrap();
+    assert_ne!(hook.status, 0);
+    assert!(!repo.path().join(".git/hooks/pre-commit").exists());
+
+    let normal =
+        converge::run_admitted_shell(&session, "echo fine > normal.txt; git status").unwrap();
+    assert_eq!(normal.status, 0, "{}", normal.stderr);
+    assert!(repo.path().join("normal.txt").exists());
+
+    // The commit hook still runs inside the sandbox, and still blocks on a failing lint.
+    for setting in [["user.name", "t"], ["user.email", "t@example.com"]] {
+        Command::new("git")
+            .arg("config")
+            .args(setting)
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+    }
+    converge::install_hook(repo.path(), Path::new(env!("CARGO_BIN_EXE_converge"))).unwrap();
+    let lint = repo.path().join("lint");
+    fs::write(&lint, "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&lint, fs::Permissions::from_mode(0o755)).unwrap();
+    let commit = "git add -A && git commit -m agent";
+    let blocked = converge::run_admitted_shell(&session, commit).unwrap();
+    assert_ne!(blocked.status, 0);
+    assert!(blocked.stderr.contains("lint failed"), "{}", blocked.stderr);
+    fs::write(&lint, "#!/bin/sh\nexit 0\n").unwrap();
+    let passed = converge::run_admitted_shell(&session, commit).unwrap();
+    assert_eq!(passed.status, 0, "{}", passed.stderr);
+    drop(server);
+    let _ = fs::remove_dir_all(&base);
+}

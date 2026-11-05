@@ -16,6 +16,7 @@ mod model;
 mod modes;
 mod provider;
 mod run;
+mod sandbox;
 mod secret;
 mod session;
 mod shell;
@@ -52,6 +53,7 @@ pub use provider::{
     ProviderProfile, Resolved,
 };
 pub use run::{run_print, stop_allowed};
+pub use sandbox::available as sandbox_available;
 pub use session::{
     create as create_session, load_unfinished, save as save_session, set_goal, set_permission_mode,
     set_work_mode, Budget, Session, Usage, DEFAULT_STEP_BUDGET,

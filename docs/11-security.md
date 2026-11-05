@@ -25,6 +25,18 @@ The hook on the completion command refuses to stop while the test command has no
 
 Hooks hold actions. Memory contents do not hold actions.
 
+## Shell sandbox
+
+A command the model can influence runs in an OS sandbox: the shell tool and the completion command, because the model can edit what that command runs. It cannot read or write `~/.converge`, cannot connect to the session socket, and cannot write `weights/` or the git hooks directory.
+
+| Place | Sandbox |
+|---|---|
+| macOS | `sandbox-exec` |
+| Linux | `bwrap`, when it is installed and the kernel allows it |
+| Windows, or where the sandbox cannot start | None. The kernel warns, and only checks on the command text remain |
+
+A backend CLI and the commit hook's lint run outside the sandbox. They are the user's own tools.
+
 ## Retention
 
 Retention is a kernel action on memory notes and MMDP objects. Retention does not delete git commits the user owns.

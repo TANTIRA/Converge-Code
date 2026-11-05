@@ -37,6 +37,13 @@ jobs:
           fi
           rustup component add rustfmt
           cargo fmt --check
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get install -y bubblewrap
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            export CONVERGE_EXPECT_SANDBOX=1
+          fi
           cargo test --no-fail-fast
 
   live:

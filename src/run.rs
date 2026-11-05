@@ -49,6 +49,9 @@ fn print_session(cwd: &Path, args: &Args) -> Result<i32> {
         Some(&instructions::user_instructions(&home)),
     )?;
     let mut session = session::open_for_print(&home, &workspace, args.goal.clone())?;
+    if let Some(warning) = crate::sandbox::missing_warning() {
+        eprintln!("{warning}");
+    }
     let mut messages = vec![
         json!({
             "role": "system",

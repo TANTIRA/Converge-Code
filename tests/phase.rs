@@ -111,11 +111,11 @@ fn shell_timeout_kills_the_process_and_a_split_path_cannot_replace_the_goal() {
         !command.contains(".converge"),
         "the pre-check must not be what stops this command"
     );
-    let error = match converge::run_admitted_shell(&session, &command) {
-        Ok(_) => panic!("shell must not keep a rewritten session"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("session goal"));
+    // A sandbox stops the write outright. Without one, the session restores the record.
+    match converge::run_admitted_shell(&session, &command) {
+        Ok(output) => assert!(converge::sandbox_available() && output.status != 0),
+        Err(error) => assert!(error.to_string().contains("session goal")),
+    }
     assert_eq!(fs::read_to_string(&record).unwrap(), before);
 }
 

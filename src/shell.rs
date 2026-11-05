@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::home;
 use crate::provider;
+use crate::sandbox::{self, Protected};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_CAPTURE: usize = 1024 * 1024;
@@ -26,10 +27,34 @@ pub fn run(cwd: &Path, command: &str) -> Result<CommandOutput> {
 }
 
 pub fn run_timeout(cwd: &Path, command: &str, timeout: Duration) -> Result<CommandOutput> {
+    run_invocation(cwd, command, timeout, shell_invocation())
+}
+
+// For commands the model can influence: its own, and a test command it can edit.
+pub(crate) fn run_sandboxed(
+    cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    protected: &Protected,
+) -> Result<CommandOutput> {
+    let shell = shell_invocation();
+    let invocation = if sandbox::available() {
+        protected.wrap(shell)
+    } else {
+        shell
+    };
+    run_invocation(cwd, command, timeout, invocation)
+}
+
+fn run_invocation(
+    cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    (program, prefix): (String, Vec<String>),
+) -> Result<CommandOutput> {
     if command.is_empty() {
         return Err(Error::new("command is empty"));
     }
-    let (program, prefix) = shell_invocation();
     let mut process = Command::new(&program);
     prepare(&mut process, cwd);
     remove_provider_keys(&mut process);
