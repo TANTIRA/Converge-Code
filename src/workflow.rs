@@ -156,8 +156,11 @@ pub(crate) fn take_finished(session_dir: &Path) -> Vec<String> {
 
 // Inside the git common dir, so the parent stays clean, and outside ~/.converge, which the sandbox closes.
 fn worktree_root(session: &Session, repo: &Path) -> Result<PathBuf> {
-    Ok(git::identify(repo)?
-        .common_dir
+    let common = git::identify(repo)?.common_dir;
+    // canonicalize returns \\\\?\\ paths on Windows, and git cannot use them.
+    let common = common.to_string_lossy();
+    let plain = common.strip_prefix(r"\\?\").unwrap_or(&common);
+    Ok(PathBuf::from(plain)
         .join("converge-worktrees")
         .join(&session.id))
 }

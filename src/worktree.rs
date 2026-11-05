@@ -40,7 +40,10 @@ pub fn add(repo: &Path, destination: &Path, branch: &str) -> Result<()> {
             thread::sleep(Duration::from_millis(25 * attempt));
             continue;
         }
-        return Err(Error::new("git worktree add failed"));
+        return Err(Error::new(format!(
+            "git worktree add failed: {}",
+            detail.trim()
+        )));
     }
 }
 
