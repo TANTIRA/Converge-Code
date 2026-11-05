@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -42,7 +42,10 @@ pub fn run_argv(
     args: &[String],
     timeout: Duration,
 ) -> Result<CommandOutput> {
-    let mut process = Command::new(program);
+    let mut process = match find_on_windows_path(program) {
+        Some(found) => Command::new(found),
+        None => Command::new(program),
+    };
     prepare(&mut process, cwd);
     process.args(args);
     finish(program, process, timeout)
@@ -185,22 +188,29 @@ unsafe extern "C" {
 }
 
 fn shell_invocation() -> (String, Vec<String>) {
-    if cfg!(windows) && !bash_available() {
-        (
+    if !cfg!(windows) {
+        return ("bash".to_string(), vec!["-lc".to_string()]);
+    }
+    match find_on_windows_path("bash") {
+        Some(bash) => (bash.to_string_lossy().into_owned(), vec!["-lc".to_string()]),
+        None => (
             "powershell".to_string(),
             vec!["-NoProfile".to_string(), "-Command".to_string()],
-        )
-    } else {
-        ("bash".to_string(), vec!["-lc".to_string()])
+        ),
     }
 }
 
-fn bash_available() -> bool {
-    Command::new("bash")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+// Windows process creation appends only .exe and checks System32 first, where bash.exe only starts WSL.
+fn find_on_windows_path(name: &str) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| {
+            let dir = dir.to_string_lossy().to_ascii_lowercase();
+            !dir.ends_with("system32") && !dir.ends_with("windowsapps")
+        })
+        .flat_map(|dir| ["exe", "cmd", "bat"].map(|ext| dir.join(name).with_extension(ext)))
+        .find(|candidate| candidate.is_file())
 }
