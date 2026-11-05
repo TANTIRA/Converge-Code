@@ -1,9 +1,9 @@
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::git;
@@ -209,7 +209,7 @@ pub fn render_chat_frame(
     let flat: Vec<String> = transcript
         .iter()
         .flat_map(|line| line.split('\n'))
-        .map(|line| fit(line, cols))
+        .flat_map(|line| wrap(line, cols))
         .collect();
     let start = flat.len().saturating_sub(body_rows);
     let mut lines = Vec::with_capacity(rows);
@@ -222,7 +222,25 @@ pub fn render_chat_frame(
 }
 
 fn fit(text: &str, cols: usize) -> String {
-    text.chars().take(cols).collect()
+    printable(text).take(cols).collect()
+}
+
+fn wrap(text: &str, cols: usize) -> Vec<String> {
+    let chars: Vec<char> = printable(text).collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars
+        .chunks(cols)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+// Model and tool text must not reach the terminal as control codes.
+fn printable(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars()
+        .map(|ch| if ch == '\t' { ' ' } else { ch })
+        .filter(|ch| !ch.is_control())
 }
 
 #[cfg(unix)]
@@ -283,6 +301,7 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
                 input.pop();
             }
             Key::Esc => input.clear(),
+            Key::Ignore => {}
             Key::ShiftTab => {
                 let next = modes::cycle_permission(&session.permission_mode);
                 session::set_permission_mode(&mut session, next)?;
@@ -406,9 +425,13 @@ fn status_line(session: &Session, home: &Path, ready: bool) -> String {
     )
 }
 
+fn read_transcript(session: &Session) -> String {
+    let bytes = std::fs::read(session.dir.join("transcript.jsonl")).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn load_view(session: &Session) -> Vec<String> {
-    let path = session.dir.join("transcript.jsonl");
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = read_transcript(session);
     let mut lines = Vec::new();
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -449,25 +472,57 @@ fn load_view(session: &Session) -> Vec<String> {
 }
 
 fn extend_messages(messages: &mut Vec<serde_json::Value>, session: &Session) {
-    let path = session.dir.join("transcript.jsonl");
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match value.get("kind").and_then(|kind| kind.as_str()) {
-            Some("user") => messages.push(serde_json::json!({
+    messages.extend(restore_messages(&read_transcript(session)));
+}
+
+pub fn restore_messages(transcript: &str) -> Vec<serde_json::Value> {
+    let records: Vec<serde_json::Value> = transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let kind = |record: &serde_json::Value| {
+        record
+            .get("kind")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut messages = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        match kind(record).as_str() {
+            "user" => messages.push(serde_json::json!({
                 "role": "user",
-                "content": value.get("text").and_then(|text| text.as_str()).unwrap_or("")
+                "content": record.get("text").and_then(|text| text.as_str()).unwrap_or("")
             })),
-            Some("assistant") => {
-                if let Some(message) = value.get("message") {
-                    messages.push(message.clone());
+            "assistant" => {
+                let Some(message) = record.get("message") else {
+                    continue;
+                };
+                messages.push(message.clone());
+                let calls = message.get("tool_calls").and_then(|calls| calls.as_array());
+                for call in calls.into_iter().flatten() {
+                    let id = call.get("id").and_then(|id| id.as_str()).unwrap_or("");
+                    // Some providers reuse ids between turns, so stop at the next model turn.
+                    let answer = records[index + 1..]
+                        .iter()
+                        .take_while(|later| kind(later) != "assistant")
+                        .find(|later| {
+                            later.get("tool_call_id").and_then(|id| id.as_str()) == Some(id)
+                        })
+                        .and_then(|later| later.get("text"))
+                        .and_then(|text| text.as_str())
+                        .unwrap_or("no result was recorded");
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": answer,
+                    }));
                 }
             }
             _ => {}
         }
     }
+    messages
 }
 
 fn last_user_text(messages: &[serde_json::Value]) -> String {
@@ -592,13 +647,17 @@ fn chat_reply(
         return Ok(0);
     }
     crate::shell::clear_stop();
+    // Chat stays open for days, so its budget covers one message, not the whole session.
+    let started = Instant::now();
+    let mut steps = 0;
+    let mut tokens = 0u64;
     loop {
         if CANCEL.load(Ordering::SeqCst) || crate::shell::stop_requested() {
             view.push("cancelled".to_string());
             return Ok(130);
         }
-        if session.used.steps >= session.budget.steps.unwrap_or(session::DEFAULT_STEP_BUDGET) {
-            view.push("budget exhausted".to_string());
+        if crate::run::exhausted(&session.budget, steps, tokens, started.elapsed().as_secs()) {
+            view.push("budget exhausted for this message".to_string());
             session::append(
                 session,
                 &serde_json::json!({"kind": "budget", "exhausted": true}),
@@ -638,9 +697,8 @@ fn chat_reply(
                 return Ok(0);
             }
         };
-        session.used.steps += 1;
-        session.used.tokens = session.used.tokens.saturating_add(turn.total_tokens);
-        session::store_used(session)?;
+        steps += 1;
+        tokens = tokens.saturating_add(turn.total_tokens);
         messages.push(turn.assistant_message.clone());
         session::append(
             session,
@@ -660,7 +718,7 @@ fn chat_reply(
         }
         for call in turn.tool_calls {
             if modes::asks(session, &call.name) {
-                let allowed = confirm_tool(&call.name, view, session, home)?;
+                let allowed = confirm_tool(&call.name, &call.arguments, view, session, home)?;
                 if !allowed {
                     let text = format!("{} denied", call.name);
                     view.push(text.clone());
@@ -675,7 +733,12 @@ fn chat_reply(
                     }));
                     session::append(
                         session,
-                        &serde_json::json!({"kind": "denied", "name": call.name}),
+                        &serde_json::json!({
+                            "kind": "denied",
+                            "name": call.name,
+                            "tool_call_id": call.id,
+                            "text": text,
+                        }),
                     )?;
                     continue;
                 }
@@ -697,20 +760,43 @@ fn chat_reply(
             }));
             session::append(
                 session,
-                &serde_json::json!({"kind": "tool", "name": call.name, "text": &result}),
+                &serde_json::json!({
+                    "kind": "tool",
+                    "name": call.name,
+                    "tool_call_id": call.id,
+                    "text": &result,
+                }),
             )?;
         }
     }
 }
 
+// shortcut: a call taller than the screen shows only its end; upgrade when the view can scroll.
+fn describe_call(name: &str, arguments: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let field = |key: &str| parsed.get(key).and_then(|value| value.as_str());
+    match (name, field("command"), field("path")) {
+        ("shell", Some(command), _) => command.to_string(),
+        ("edit", _, Some(path)) => format!(
+            "{path}\n- {}\n+ {}",
+            field("old").unwrap_or(""),
+            field("new").unwrap_or("")
+        ),
+        _ => arguments.to_string(),
+    }
+}
+
 fn confirm_tool(
     name: &str,
+    arguments: &str,
     view: &mut Vec<String>,
     session: &Session,
     home: &Path,
 ) -> Result<bool> {
-    crate::uhp::publish_focused("permission/ask", serde_json::json!({"name": name}));
-    let prompt = format!("allow {name}? [y/n] ");
+    let call = describe_call(name, arguments);
+    crate::uhp::publish_ask(name, &call);
+    view.push(format!("{name} asks to run:\n{call}"));
+    let prompt = format!("allow {name}? type y and Enter, anything else denies: ");
     let mut answer = String::new();
     let mut dirty = true;
     loop {
@@ -733,8 +819,7 @@ fn confirm_tool(
         }
         dirty = true;
         match read_key()? {
-            Key::Char('y') | Key::Char('Y') => return Ok(true),
-            Key::Char('n') | Key::Char('N') | Key::Esc => return Ok(false),
+            Key::Esc => return Ok(false),
             Key::CtrlC => {
                 CANCEL.store(true, Ordering::SeqCst);
                 return Ok(false);
@@ -744,7 +829,7 @@ fn confirm_tool(
             }
             Key::Char(ch) => answer.push(ch),
             Key::Enter => return Ok(answer.eq_ignore_ascii_case("y")),
-            Key::ShiftTab | Key::CtrlD => {}
+            Key::ShiftTab | Key::CtrlD | Key::Ignore => {}
         }
     }
 }
@@ -779,42 +864,95 @@ enum Key {
     ShiftTab,
     CtrlC,
     CtrlD,
+    Ignore,
 }
 
-#[cfg(unix)]
-fn read_key() -> Result<Key> {
-    let mut byte = [0u8; 1];
-    io::stdin()
-        .read_exact(&mut byte)
-        .map_err(|error| Error::new(format!("stdin: {error}")))?;
-    match byte[0] {
+// `next` returns the next input byte if one arrives within the timeout in milliseconds.
+fn decode_key(first: u8, next: &mut dyn FnMut(i32) -> Result<Option<u8>>) -> Result<Key> {
+    match first {
         3 => Ok(Key::CtrlC),
         4 => Ok(Key::CtrlD),
         b'\r' | b'\n' => Ok(Key::Enter),
         0x7f | 0x08 => Ok(Key::Backspace),
-        0x1b => read_escape(),
-        value if (0x20..0x7f).contains(&value) => Ok(Key::Char(value as char)),
-        _ => read_key(),
+        0x1b => decode_escape(next),
+        0x20..=0x7e => Ok(Key::Char(first as char)),
+        0xc2..=0xf4 => decode_utf8(first, next),
+        _ => Ok(Key::Ignore),
     }
 }
 
-#[cfg(unix)]
-fn read_escape() -> Result<Key> {
-    let mut sequence = String::new();
-    while poll_stdin(20)? {
-        let mut byte = [0u8; 1];
-        io::stdin()
-            .read_exact(&mut byte)
-            .map_err(|error| Error::new(format!("stdin: {error}")))?;
-        sequence.push(byte[0] as char);
-        if sequence.len() > 8 {
-            break;
+fn decode_escape(next: &mut dyn FnMut(i32) -> Result<Option<u8>>) -> Result<Key> {
+    match next(20)? {
+        None => Ok(Key::Esc),
+        Some(b'[') => {
+            let mut parameters = false;
+            while let Some(byte) = next(20)? {
+                if (0x40..=0x7e).contains(&byte) {
+                    return Ok(if byte == b'Z' && !parameters {
+                        Key::ShiftTab
+                    } else {
+                        Key::Ignore
+                    });
+                }
+                parameters = true;
+            }
+            Ok(Key::Ignore)
+        }
+        Some(b'O') => {
+            next(20)?;
+            Ok(Key::Ignore)
+        }
+        Some(_) => Ok(Key::Ignore),
+    }
+}
+
+fn decode_utf8(first: u8, next: &mut dyn FnMut(i32) -> Result<Option<u8>>) -> Result<Key> {
+    let length = match first {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    };
+    let mut bytes = vec![first];
+    while bytes.len() < length {
+        match next(20)? {
+            Some(byte) => bytes.push(byte),
+            None => return Ok(Key::Ignore),
         }
     }
-    if sequence == "[Z" {
-        Ok(Key::ShiftTab)
-    } else {
-        Ok(Key::Esc)
+    Ok(std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.chars().next())
+        .map_or(Key::Ignore, Key::Char))
+}
+
+#[cfg(unix)]
+fn read_key() -> Result<Key> {
+    let first = read_byte()?;
+    decode_key(first, &mut |millis| {
+        if poll_stdin(millis)? {
+            read_byte().map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+// Reads the descriptor directly: io::stdin() buffers bytes that poll() can no longer see.
+#[cfg(unix)]
+fn read_byte() -> Result<u8> {
+    use std::os::unix::io::AsRawFd;
+    let mut byte = 0u8;
+    loop {
+        match unsafe { read(io::stdin().as_raw_fd(), &mut byte, 1) } {
+            1 => return Ok(byte),
+            0 => return Err(Error::new("stdin: end of input")),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(Error::new(format!("stdin: {error}")));
+                }
+            }
+        }
     }
 }
 
@@ -839,6 +977,9 @@ fn poll_stdin(timeout_ms: i32) -> Result<bool> {
     };
     let rc = unsafe { poll(&mut fd, 1, timeout_ms) };
     if rc < 0 {
+        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
         return Err(Error::new("could not read the terminal"));
     }
     Ok(rc > 0)
@@ -895,6 +1036,7 @@ struct Winsize {
 extern "C" {
     fn ioctl(fd: i32, request: u64, winsize: *mut Winsize) -> i32;
     fn poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32;
+    fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
 }
 
 #[cfg(unix)]
@@ -1056,8 +1198,8 @@ mod windows_screen {
     use std::path::Path;
 
     use super::{
-        chat_prompt, chat_reply, command_line, extend_messages, load_view, paint,
-        raw_console_modes, render_chat_frame, status_line, Key, CANCEL,
+        chat_prompt, decode_key, extend_messages, load_view, paint, raw_console_modes,
+        render_chat_frame, status_line, Key, CANCEL,
     };
     use crate::error::{Error, Result};
     use crate::session::{self, Session};
@@ -1181,6 +1323,7 @@ mod windows_screen {
                     input.pop();
                 }
                 Key::Esc => input.clear(),
+                Key::Ignore => {}
                 Key::ShiftTab => {
                     let next = crate::modes::cycle_permission(&session.permission_mode);
                     session::set_permission_mode(&mut session, next)?;
@@ -1255,34 +1398,14 @@ mod windows_screen {
     }
 
     pub(super) fn read_key() -> Result<Key> {
-        let byte = read_byte()?;
-        if byte == 0x1b {
-            return read_escape();
-        }
-        match byte {
-            b'\r' | b'\n' => Ok(Key::Enter),
-            0x7f | 0x08 => Ok(Key::Backspace),
-            0x03 => Ok(Key::CtrlC),
-            0x04 => Ok(Key::CtrlD),
-            value if (0x20..0x7f).contains(&value) => Ok(Key::Char(value as char)),
-            _ => Ok(Key::Char(' ')),
-        }
-    }
-
-    fn read_escape() -> Result<Key> {
-        if !pending(20) {
-            return Ok(Key::Esc);
-        }
-        let second = read_byte()?;
-        if second != b'[' || !pending(20) {
-            return Ok(Key::Esc);
-        }
-        let third = read_byte()?;
-        if third == b'Z' {
-            Ok(Key::ShiftTab)
-        } else {
-            Ok(Key::Esc)
-        }
+        let first = read_byte()?;
+        decode_key(first, &mut |millis| {
+            if pending(millis as u32) {
+                read_byte().map(Some)
+            } else {
+                Ok(None)
+            }
+        })
     }
 
     pub(super) fn pending(millis: u32) -> bool {

@@ -50,6 +50,8 @@ Encoding is JSON-RPC 2.0, UTF-8.
 | Client to kernel | `session/attach`, `session/input`, `session/selection`, `permission/respond` |
 | Kernel to client | `session/stream`, `session/tool`, `permission/ask`, `session/diff`, `session/status` |
 
+`permission/ask` carries `id`, `name`, and `arguments`, the text of the call. A client shows that text before the user answers. `permission/respond` carries the same `id` and `allow`. The kernel drops an answer whose `id` is not the open question.
+
 ## What a client does not do
 
 A client does not run its own model loop. A client does not write lessons. A client does not create a worktree outside the kernel. A client does not open bypass mode on a laptop workspace.

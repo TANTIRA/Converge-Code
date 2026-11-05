@@ -11,19 +11,23 @@ pub fn install(repo: &Path, bin: &Path) -> Result<PathBuf> {
     fs::create_dir_all(&hooks)
         .map_err(|error| Error::new(format!("create {}: {error}", hooks.display())))?;
     let hook = hooks.join("pre-commit");
+    match fs::read(&hook) {
+        Ok(existing) if !String::from_utf8_lossy(&existing).contains(" hook pre-commit") => {
+            return Err(Error::new(format!(
+                "{} already exists and is not Converge's. Merge it by hand: add `converge hook pre-commit` to it",
+                hook.display()
+            )));
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(Error::new(format!("read {}: {error}", hook.display())));
+        }
+        _ => {}
+    }
     let script = format!(
         "#!/bin/sh\ncd \"$(git rev-parse --show-toplevel)\" || exit 1\nexec {} hook pre-commit\n",
         shell_quote(bin)
     );
     write_executable(&hook, &script)?;
-    let status = Command::new("git")
-        .args(["config", "core.hooksPath", &hooks.to_string_lossy()])
-        .current_dir(repo)
-        .status()
-        .map_err(|error| Error::new(format!("git config failed to start: {error}")))?;
-    if !status.success() {
-        return Err(Error::new("git config core.hooksPath failed"));
-    }
     Ok(hook)
 }
 

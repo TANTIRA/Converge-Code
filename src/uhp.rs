@@ -17,7 +17,8 @@ struct Hub {
     emit: Box<dyn Fn(&str, bool) + Send + Sync>,
     focus_on: Box<dyn Fn(u64) + Send + Sync>,
     inputs: Mutex<VecDeque<String>>,
-    permits: Mutex<VecDeque<bool>>,
+    permit: Mutex<Option<bool>>,
+    asking: AtomicU64,
     session_id: String,
 }
 
@@ -50,8 +51,13 @@ impl Hub {
         self.inputs.lock().expect("uhp").push_back(text.to_string());
     }
 
-    fn push_permit(&self, allow: bool) {
-        self.permits.lock().expect("uhp").push_back(allow);
+    fn answer(&self, id: u64, allow: bool) {
+        let open = self
+            .asking
+            .compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+        if id != 0 && open.is_ok() {
+            *self.permit.lock().expect("uhp") = Some(allow);
+        }
     }
 
     #[cfg(windows)]
@@ -64,7 +70,8 @@ impl Hub {
             emit,
             focus_on,
             inputs: Mutex::new(VecDeque::new()),
-            permits: Mutex::new(VecDeque::new()),
+            permit: Mutex::new(None),
+            asking: AtomicU64::new(0),
             session_id,
         }
     }
@@ -77,11 +84,19 @@ pub(crate) fn publish(method: &str, params: Value) {
     hub.note(method, params, false);
 }
 
-pub(crate) fn publish_focused(method: &str, params: Value) {
+pub(crate) fn publish_ask(name: &str, arguments: &str) {
+    static NEXT_ASK: AtomicU64 = AtomicU64::new(1);
     let Some(hub) = CURRENT.lock().expect("uhp").clone() else {
         return;
     };
-    hub.note(method, params, true);
+    let id = NEXT_ASK.fetch_add(1, Ordering::SeqCst);
+    *hub.permit.lock().expect("uhp") = None;
+    hub.asking.store(id, Ordering::SeqCst);
+    hub.note(
+        "permission/ask",
+        json!({"id": id, "name": name, "arguments": arguments}),
+        true,
+    );
 }
 
 pub(crate) fn publish_diff(repo: &Path) {
@@ -100,7 +115,7 @@ pub(crate) fn poll_permission() -> Option<bool> {
     let Some(hub) = CURRENT.lock().expect("uhp").clone() else {
         return None;
     };
-    let next = hub.permits.lock().expect("uhp").pop_front();
+    let next = hub.permit.lock().expect("uhp").take();
     next
 }
 
@@ -183,7 +198,8 @@ pub fn serve(home: &Path, session: &Session, repo: &Path) -> Result<Server> {
                 })
             },
             inputs: Mutex::new(VecDeque::new()),
-            permits: Mutex::new(VecDeque::new()),
+            permit: Mutex::new(None),
+            asking: AtomicU64::new(0),
             session_id: session_id.clone(),
         };
         let hub = hub.install();
@@ -315,8 +331,10 @@ fn deliver(hub: &Hub, request: &Value) {
             hub.note("session/stream", json!({"text": text}), false);
         }
         Some("permission/respond") => {
-            if let Some(allow) = request.pointer("/params/allow").and_then(Value::as_bool) {
-                hub.push_permit(allow);
+            let id = request.pointer("/params/id").and_then(Value::as_u64);
+            let allow = request.pointer("/params/allow").and_then(Value::as_bool);
+            if let (Some(id), Some(allow)) = (id, allow) {
+                hub.answer(id, allow);
             }
         }
         _ => {}
@@ -399,14 +417,7 @@ fn read_transcript(session_dir: &Path) -> String {
 }
 
 fn append_line(session_dir: &Path, value: &Value) {
-    let path = session_dir.join("transcript.jsonl");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{value}");
-    }
+    let _ = crate::session::append_record(session_dir, value);
 }
 
 fn git_diff(repo: &Path) -> String {
@@ -562,6 +573,8 @@ mod windows_pipe {
                 let repo = repo.clone();
                 let pipe = PipeHandle(pipe);
                 thread::spawn(move || {
+                    // Edition 2021 would otherwise capture only the raw pointer, which is not Send.
+                    let pipe = pipe;
                     read_pipe(pipe.0, &hub, id, &session_dir, &session_id, &repo);
                     let _ = unsafe { DisconnectNamedPipe(pipe.0) };
                     close_pipe(pipe.0);
@@ -735,8 +748,8 @@ mod windows_pipe {
         }
     }
 
-    fn wide(text: &str) -> Vec<u16> {
-        OsStr::new(text).encode_wide().chain(Some(0)).collect()
+    fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
+        text.as_ref().encode_wide().chain(Some(0)).collect()
     }
 }
 

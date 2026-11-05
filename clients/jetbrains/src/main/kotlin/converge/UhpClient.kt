@@ -32,10 +32,10 @@ class UhpClient {
         )
     }
 
-    fun respond(sessionId: String, allow: Boolean): String {
+    fun respond(sessionId: String, askId: Long, allow: Boolean): String {
         return line(
             "permission/respond",
-            """{"session_id":${quote(sessionId)},"allow":$allow}""",
+            """{"session_id":${quote(sessionId)},"id":$askId,"allow":$allow}""",
             4,
         )
     }

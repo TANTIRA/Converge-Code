@@ -149,17 +149,32 @@ pub fn set_permission_mode(session: &mut Session, mode: &str) -> Result<()> {
 }
 
 pub fn append(session: &Session, value: &Value) -> Result<()> {
-    let path = session.dir.join("transcript.jsonl");
+    append_record(&session.dir, value)
+}
+
+// One write call per line, so a client thread cannot interleave with the agent loop.
+pub(crate) fn append_record(dir: &Path, value: &Value) -> Result<()> {
+    let path = dir.join("transcript.jsonl");
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .map_err(|error| Error::new(format!("open {}: {error}", path.display())))?;
-    serde_json::to_writer(&mut file, value)
-        .map_err(|error| Error::new(format!("write transcript: {error}")))?;
-    file.write_all(b"\n")
-        .map_err(|error| Error::new(format!("write transcript: {error}")))?;
-    Ok(())
+    file.write_all(format!("{value}\n").as_bytes())
+        .map_err(|error| Error::new(format!("write transcript: {error}")))
+}
+
+pub fn apply_budget_env(session: &mut Session) -> Result<()> {
+    let steps = optional_u64("CONVERGE_BUDGET_STEPS")?;
+    let tokens = optional_u64("CONVERGE_BUDGET_TOKENS")?;
+    let seconds = optional_u64("CONVERGE_BUDGET_SECONDS")?;
+    if steps.is_none() && tokens.is_none() && seconds.is_none() {
+        return Ok(());
+    }
+    session.budget.steps = steps.or(session.budget.steps);
+    session.budget.tokens = tokens.or(session.budget.tokens);
+    session.budget.seconds = seconds.or(session.budget.seconds);
+    save(session)
 }
 
 pub fn budget_from_env() -> Result<Budget> {
@@ -194,17 +209,16 @@ fn same_workspace(stored: &Path, toplevel: &Path) -> Result<bool> {
 
 fn transcript_passed(dir: &Path) -> Result<bool> {
     let path = dir.join("transcript.jsonl");
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(Error::new(format!("read {}: {error}", path.display()))),
     };
-    for line in text.lines() {
-        if line.is_empty() {
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        // A crash can leave a partial last line. That must not lock the whole repo.
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
-        }
-        let value: Value = serde_json::from_str(line)
-            .map_err(|error| Error::new(format!("read {}: {error}", path.display())))?;
+        };
         let test = value.get("kind").and_then(Value::as_str) == Some("test");
         let passed = value.get("status").and_then(Value::as_i64) == Some(0);
         if test && passed {
@@ -221,8 +235,13 @@ fn read_session(dir: &Path) -> Result<Option<Session>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Error::new(format!("read {}: {error}", path.display()))),
     };
-    let record: StoredSession = serde_json::from_slice(&bytes)
-        .map_err(|error| Error::new(format!("read {}: {error}", path.display())))?;
+    let record: StoredSession = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            eprintln!("skipping damaged session {}: {error}", path.display());
+            return Ok(None);
+        }
+    };
     Ok(Some(Session {
         id: record.session_id,
         dir: dir.to_path_buf(),
@@ -260,7 +279,9 @@ fn write_record(session: &Session) -> Result<()> {
     let path = session.dir.join("session.json");
     let bytes = serde_json::to_vec_pretty(&record)
         .map_err(|error| Error::new(format!("encode session: {error}")))?;
-    fs::write(&path, bytes)
+    let temporary = session.dir.join("session.json.tmp");
+    fs::write(&temporary, bytes)
+        .and_then(|_| fs::rename(&temporary, &path))
         .map_err(|error| Error::new(format!("write {}: {error}", path.display())))
 }
 

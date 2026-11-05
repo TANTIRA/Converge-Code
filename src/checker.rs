@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -12,11 +12,9 @@ pub fn allow(workspace: &Path, name: &str, arguments: &str) -> Result<()> {
 
 fn allow_edit(workspace: &Path, arguments: &str) -> Result<()> {
     let path = argument(arguments, "path");
-    let resolved = resolve_inside(workspace, &path)?;
-    if resolved.starts_with(workspace.join("weights")) {
-        return Err(rejected());
-    }
-    Ok(())
+    crate::edit::resolve_inside(workspace, &path)
+        .map(|_| ())
+        .map_err(|_| rejected())
 }
 
 fn allow_shell(workspace: &Path, arguments: &str) -> Result<()> {
@@ -29,39 +27,15 @@ fn allow_shell(workspace: &Path, arguments: &str) -> Result<()> {
         if token.split(['/', '\\']).any(|part| part == "..") {
             return Err(rejected());
         }
+        if token.starts_with('~') || token.contains("$HOME") || token.contains("${HOME") {
+            return Err(rejected());
+        }
         let path = Path::new(&token);
         if path.is_absolute() && !normalize(path).starts_with(&workspace) {
             return Err(rejected());
         }
     }
     Ok(())
-}
-
-fn resolve_inside(root: &Path, relative: &str) -> Result<PathBuf> {
-    if relative.is_empty() {
-        return Err(rejected());
-    }
-    let relative_path = Path::new(relative);
-    if relative_path.is_absolute() {
-        return Err(rejected());
-    }
-    let mut resolved = root.to_path_buf();
-    for component in relative_path.components() {
-        match component {
-            Component::Normal(part) => resolved.push(part),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !resolved.pop() || !resolved.starts_with(root) {
-                    return Err(rejected());
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => return Err(rejected()),
-        }
-    }
-    if !resolved.starts_with(root) {
-        return Err(rejected());
-    }
-    Ok(resolved)
 }
 
 fn tokens(command: &str) -> Vec<String> {

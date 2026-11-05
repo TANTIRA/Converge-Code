@@ -43,7 +43,7 @@ pub use memory::{load_index, revert_lesson, write_learning_skill, write_lesson};
 pub use mmdp::put_file as mmdp_put_file;
 pub use modes::{
     admit, approve_plan, compact_window, cycle_permission, reject_plan, run_admitted_shell,
-    unattended_auto_exit, write_plan,
+    unattended_exit, write_plan,
 };
 pub use provider::{
     choose, configure_provider, list as list_providers, store_api_key, use_provider, Env,
@@ -58,7 +58,9 @@ pub use shell::{
     clear_stop as clear_shell_cancel, request_stop as cancel_shell, run as run_shell,
     run_timeout as run_shell_timeout, CommandOutput,
 };
-pub use tty::{format_turn, raw_console_modes, render_chat_frame, run_chat, wait_for_turn};
+pub use tty::{
+    format_turn, raw_console_modes, render_chat_frame, restore_messages, run_chat, wait_for_turn,
+};
 pub use uhp::{allowed_methods, endpoint, serve};
 pub use weights::{abort as abort_weight, promote as promote_weight, WeightEdit};
 pub use windows_isolation::{admit as windows_isolation_admit, laptop_bypass};

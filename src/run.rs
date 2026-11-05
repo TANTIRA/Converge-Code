@@ -43,6 +43,7 @@ pub fn run_print(cwd: &Path, args: &Args) -> Result<i32> {
             if let Some(goal) = args.goal.clone() {
                 session::set_goal(&mut existing, goal)?;
             }
+            session::apply_budget_env(&mut existing)?;
             existing
         }
         None => {
@@ -108,8 +109,7 @@ fn execute(
     loop {
         let seconds = base_seconds.saturating_add(started.elapsed().as_secs());
         if exhausted(&session.budget, steps, tokens, seconds) {
-            session::append(session, &json!({"kind": "budget", "exhausted": true}))?;
-            return Ok(1);
+            return out_of_budget(session);
         }
         let turn = model.complete(messages, &tools)?;
         steps += 1;
@@ -134,8 +134,7 @@ fn execute(
             crate::uhp::publish("session/stream", json!({"text": spoken}));
         }
         if over_token_budget(session.budget.tokens, tokens) {
-            session::append(session, &json!({"kind": "budget", "exhausted": true}))?;
-            return Ok(1);
+            return out_of_budget(session);
         }
         if turn.tool_calls.is_empty() {
             let output = modes::run_session_shell(session, test_command)?;
@@ -175,8 +174,12 @@ fn execute(
             return Ok(1);
         }
         for call in &turn.tool_calls {
-            if let Some(code) = modes::unattended_auto_exit(session, &call.name, &call.arguments) {
+            if let Some(code) = modes::unattended_exit(session, &call.name, &call.arguments) {
                 session::append(session, &json!({"kind": "denied", "name": call.name}))?;
+                eprintln!(
+                    "{} needs permission, and there is no terminal to ask (permission mode {}). Change it with converge mode permission <mode>.",
+                    call.name, session.permission_mode
+                );
                 return Ok(code);
             }
             let result = dispatch(session, &call.name, &call.arguments, false);
@@ -187,7 +190,7 @@ fn execute(
             }));
             session::append(
                 session,
-                &json!({"kind": "tool", "name": call.name, "text": &result}),
+                &json!({"kind": "tool", "name": call.name, "tool_call_id": call.id, "text": &result}),
             )?;
             crate::uhp::publish("session/tool", json!({"name": call.name, "text": &result}));
             if call.name == "edit" {
@@ -247,7 +250,15 @@ fn system_prompt(instructions: &str, test_command: &str, goal: Option<&str>) -> 
     prompt
 }
 
-fn exhausted(budget: &Budget, steps: u64, tokens: u64, seconds: u64) -> bool {
+fn out_of_budget(session: &Session) -> Result<i32> {
+    session::append(session, &json!({"kind": "budget", "exhausted": true}))?;
+    eprintln!(
+        "budget exhausted. Raise CONVERGE_BUDGET_STEPS, CONVERGE_BUDGET_TOKENS, or CONVERGE_BUDGET_SECONDS and run again to continue."
+    );
+    Ok(1)
+}
+
+pub(crate) fn exhausted(budget: &Budget, steps: u64, tokens: u64, seconds: u64) -> bool {
     if steps >= budget.steps.unwrap_or(session::DEFAULT_STEP_BUDGET) {
         return true;
     }

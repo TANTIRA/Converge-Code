@@ -8,11 +8,6 @@ use crate::error::{Error, Result};
 
 pub fn apply(root: &Path, relative: &str, old: &str, new: &str) -> Result<String> {
     let path = resolve_inside(root, relative)?;
-    if root.join("weights").is_dir() && path.starts_with(root.join("weights")) {
-        return Err(Error::new(
-            "weight bytes cannot be written outside PromoteWeightEdit",
-        ));
-    }
     if !path.exists() {
         if !old.is_empty() {
             return Err(Error::new(format!("file not found: {relative}")));
@@ -41,7 +36,7 @@ pub fn apply(root: &Path, relative: &str, old: &str, new: &str) -> Result<String
     Ok(format!("edited {relative}"))
 }
 
-fn resolve_inside(root: &Path, relative: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_inside(root: &Path, relative: &str) -> Result<PathBuf> {
     if relative.is_empty() {
         return Err(Error::new("path is empty"));
     }
@@ -67,7 +62,37 @@ fn resolve_inside(root: &Path, relative: &str) -> Result<PathBuf> {
     if !resolved.starts_with(root) {
         return Err(Error::new("path must stay inside the workspace"));
     }
+    check_real_path(root, &resolved)?;
     Ok(resolved)
+}
+
+// Judges the path after symlinks, and without case, as macOS and Windows open it.
+fn check_real_path(root: &Path, path: &Path) -> Result<()> {
+    let outside = || Error::new("path must stay inside the workspace");
+    let real_root = root.canonicalize().map_err(|_| outside())?;
+    let mut existing = path;
+    while fs::symlink_metadata(existing).is_err() {
+        existing = existing.parent().ok_or_else(outside)?;
+    }
+    let real = existing.canonicalize().map_err(|_| outside())?;
+    let missing = path.strip_prefix(existing).map_err(|_| outside())?;
+    let inside = real
+        .strip_prefix(&real_root)
+        .map_err(|_| outside())?
+        .join(missing);
+    if inside.iter().any(|part| part.eq_ignore_ascii_case(".git")) {
+        return Err(Error::new("the edit tool does not write inside .git"));
+    }
+    let weights = inside
+        .iter()
+        .next()
+        .is_some_and(|part| part.eq_ignore_ascii_case("weights"));
+    if weights && root.join("weights").is_dir() {
+        return Err(Error::new(
+            "weight bytes cannot be written outside PromoteWeightEdit",
+        ));
+    }
+    Ok(())
 }
 
 fn retry<T>(op: impl Fn() -> std::io::Result<T>, action: &str, path: &Path) -> Result<T> {

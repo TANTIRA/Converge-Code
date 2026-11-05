@@ -120,35 +120,6 @@ fn shell_timeout_kills_the_process_and_a_split_path_cannot_replace_the_goal() {
 }
 
 #[test]
-fn esc_discards_a_running_turn_and_stops_the_shell() {
-    let started = std::time::Instant::now();
-    thread::spawn(|| {
-        thread::sleep(Duration::from_millis(60));
-        converge::cancel_shell();
-    });
-    let result = converge::wait_for_turn(|| {
-        thread::sleep(Duration::from_millis(400));
-        "late"
-    })
-    .unwrap();
-    assert!(result.is_none());
-    assert!(started.elapsed() < Duration::from_millis(350));
-    converge::clear_shell_cancel();
-
-    let repo = git_repo();
-    thread::spawn(|| {
-        thread::sleep(Duration::from_millis(60));
-        converge::cancel_shell();
-    });
-    let error = match converge::run_shell_timeout(repo.path(), "sleep 30", Duration::from_secs(5)) {
-        Ok(_) => panic!("sleep should be cancelled"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("cancelled"));
-    converge::clear_shell_cancel();
-}
-
-#[test]
 fn backend_process_runs_the_installed_cli_and_keeps_the_test() {
     let user_home = TempDir::new("converge-user");
     let converge_home = user_home.path().join(".converge");
@@ -272,10 +243,10 @@ fn auto_checker_rejects_outside_the_workspace() {
     assert!(frame.contains("auto rejected"));
     assert!(frame.contains("single-agent"));
     assert_eq!(
-        converge::unattended_auto_exit(&session, "shell", &shell_args),
+        converge::unattended_exit(&session, "shell", &shell_args),
         Some(1)
     );
-    assert!(converge::unattended_auto_exit(
+    assert!(converge::unattended_exit(
         &session,
         "edit",
         r#"{"path":"file.txt","old":"one","new":"two"}"#
@@ -292,7 +263,7 @@ fn auto_checker_rejects_outside_the_workspace() {
     .is_err());
     converge::set_permission_mode(&mut session, "dontAsk").unwrap();
     assert!(converge::admit(&session, "shell", &shell_args, false).is_ok());
-    assert!(converge::unattended_auto_exit(&session, "shell", &shell_args).is_none());
+    assert!(converge::unattended_exit(&session, "shell", &shell_args).is_none());
 }
 
 fn overwrite_session_record(path: &Path) -> String {

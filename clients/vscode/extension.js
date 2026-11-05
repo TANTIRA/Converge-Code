@@ -141,7 +141,7 @@ function handleMessage(line, handlers) {
   } else if (method === "session/tool") {
     handlers.onTool && handlers.onTool(params.name || "", params.text || "");
   } else if (method === "permission/ask") {
-    handlers.onPermission && handlers.onPermission(params.name || "");
+    handlers.onPermission && handlers.onPermission(params.id, params.name || "", params.arguments || "");
   } else if (method === "session/diff") {
     handlers.onDiff && handlers.onDiff(params.diff || "");
   } else if (method === "session/status") {
@@ -201,7 +201,7 @@ function activate(context) {
         handleMessage(line, {
           onStream: (text) => show(text),
           onTool: (name, text) => show("tool " + name + "\n" + text),
-          onPermission: (name) => ask(name),
+          onPermission: (id, name, call) => ask(id, name, call),
           onDiff: (diff) => show(diff),
           onStatus: (params) => {
             const mode = [params.work_mode, params.permission_mode].filter(Boolean).join(" ");
@@ -226,13 +226,15 @@ function activate(context) {
     });
   }
 
-  function ask(name) {
-    vscode.window.showInformationMessage("Allow " + name + "?", "Allow", "Deny").then((choice) => {
-      if (!choice) {
-        return;
-      }
-      write("permission/respond", { allow: choice === "Allow" });
-    });
+  function ask(id, name, call) {
+    vscode.window
+      .showInformationMessage("Allow " + name + "?", { modal: true, detail: call }, "Allow", "Deny")
+      .then((choice) => {
+        if (!choice) {
+          return;
+        }
+        write("permission/respond", { id, allow: choice === "Allow" });
+      });
   }
 
   context.subscriptions.push(

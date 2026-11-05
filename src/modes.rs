@@ -78,6 +78,12 @@ pub fn admit(session: &Session, name: &str, arguments: &str, tty: bool) -> Resul
         if session.work_mode == "ask" && !read_only(&command) {
             return Err(Error::new("ask mode does not change state"));
         }
+        if session.work_mode == "plan" && !read_only(&command) {
+            return Err(Error::new("plan mode does not change state"));
+        }
+        if skips_commit_hook(&command) {
+            return Err(Error::new("the shell cannot skip the commit hook"));
+        }
         if shell_targets_session(&command) {
             return Err(Error::new("the shell cannot change the session goal"));
         }
@@ -96,14 +102,10 @@ pub fn admit(session: &Session, name: &str, arguments: &str, tty: bool) -> Resul
     Ok(())
 }
 
-pub fn unattended_auto_exit(session: &Session, name: &str, arguments: &str) -> Option<i32> {
-    if session.permission_mode != "auto" {
-        return None;
-    }
-    match admit(session, name, arguments, false) {
-        Ok(()) => None,
-        Err(_) => Some(1),
-    }
+pub fn unattended_exit(session: &Session, name: &str, arguments: &str) -> Option<i32> {
+    let denied = would_ask(session, name)
+        || (session.permission_mode == "auto" && admit(session, name, arguments, false).is_err());
+    denied.then_some(1)
 }
 
 pub fn run_admitted_shell(session: &Session, command: &str) -> Result<shell::CommandOutput> {
@@ -163,6 +165,13 @@ fn read_only(command: &str) -> bool {
     if trimmed.is_empty() || has_shell_syntax(trimmed) {
         return false;
     }
+    // git accepts abbreviated options: --outp writes a file, --ext runs a configured program.
+    if trimmed
+        .split_whitespace()
+        .any(|word| word.starts_with("--ou") || word.starts_with("--ext"))
+    {
+        return false;
+    }
     trimmed == "pwd"
         || whole_command(trimmed, "ls")
         || whole_command(trimmed, "git status")
@@ -184,15 +193,77 @@ fn has_shell_syntax(command: &str) -> bool {
     })
 }
 
+// shortcut: these checks read the command text, so a glob or a script can get past them; upgrade to an OS sandbox over ~/.converge and weights/.
 fn shell_targets_session(command: &str) -> bool {
     command.contains(".converge")
 }
 
 fn writes_weights(command: &str) -> bool {
-    if !(command.contains("weights/") || command.contains("weights\\")) {
-        return false;
+    command.to_ascii_lowercase().contains("weights") && !read_only(command)
+}
+
+fn skips_commit_hook(command: &str) -> bool {
+    if command.contains("CONVERGE_LINT=") {
+        return true;
     }
-    !read_only(command)
+    if command.contains("core.hooksPath") && command.split_whitespace().any(|word| word == "git") {
+        return true;
+    }
+    without_quoted_text(command)
+        .split([';', '&', '|', '\n', '(', ')'])
+        .any(|part| {
+            let words: Vec<&str> = part.split_whitespace().collect();
+            let flags = git_subcommand_args(&words, "commit");
+            flags.is_some_and(|flags| flags.iter().any(|word| disables_verify(word)))
+        })
+}
+
+fn without_quoted_text(command: &str) -> String {
+    let mut quote = None;
+    command
+        .chars()
+        .filter(|ch| match quote {
+            Some(open) => {
+                if *ch == open {
+                    quote = None;
+                }
+                false
+            }
+            None if matches!(ch, '"' | '\'') => {
+                quote = Some(*ch);
+                false
+            }
+            None => true,
+        })
+        .collect()
+}
+
+// The arguments after `git <subcommand>`, past global options such as `-c name=value`.
+fn git_subcommand_args<'a>(words: &'a [&'a str], subcommand: &str) -> Option<&'a [&'a str]> {
+    let git = words.iter().position(|word| *word == "git")?;
+    let mut index = git + 1;
+    while let Some(word) = words.get(index) {
+        if matches!(*word, "-c" | "-C") {
+            index += 2;
+        } else if word.starts_with('-') {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    (words.get(index) == Some(&subcommand)).then(|| &words[index + 1..])
+}
+
+fn disables_verify(word: &str) -> bool {
+    if word.starts_with("--") {
+        return word.starts_with("--no-v");
+    }
+    // In `-anm`, the letters after m are the message, so only the ones before it are flags.
+    word.starts_with('-')
+        && word[1..]
+            .chars()
+            .take_while(|ch| *ch != 'm')
+            .any(|ch| ch == 'n')
 }
 
 fn command_argument(arguments: &str) -> String {

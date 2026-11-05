@@ -2,6 +2,7 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,9 @@ use crate::home;
 use crate::provider;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CAPTURE: usize = 1024 * 1024;
+// A background child can hold the pipes open for as long as it lives, so wait only briefly.
+const PIPE_GRACE: Duration = Duration::from_millis(500);
 
 pub struct CommandOutput {
     pub status: i32,
@@ -74,22 +78,14 @@ fn finish(program: &str, mut process: Command, timeout: Duration) -> Result<Comm
             Error::new(format!("{program} failed to start: {error}"))
         }
     })?;
-    let stdout = child
-        .stdout
-        .take()
-        .map(|pipe| thread::spawn(move || read_pipe(pipe)));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|pipe| thread::spawn(move || read_pipe(pipe)));
+    let stdout = child.stdout.take().map(capture);
+    let stderr = child.stderr.take().map(capture);
     let started = Instant::now();
     let status = loop {
         if started.elapsed() >= timeout || stop_requested() {
             let cancelled = stop_requested();
             kill_tree(&mut child);
             let _ = child.wait();
-            let _ = stdout.map(|handle| handle.join());
-            let _ = stderr.map(|handle| handle.join());
             if cancelled {
                 return Err(Error::new("command cancelled"));
             }
@@ -105,8 +101,8 @@ fn finish(program: &str, mut process: Command, timeout: Duration) -> Result<Comm
             }
         }
     };
-    let stdout = join_pipe(stdout);
-    let stderr = join_pipe(stderr);
+    let stdout = collect(stdout);
+    let stderr = collect(stderr);
     Ok(CommandOutput {
         status: status.code().unwrap_or(1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -128,16 +124,42 @@ pub(crate) fn stop_requested() -> bool {
     STOP.load(Ordering::SeqCst)
 }
 
-fn read_pipe(mut pipe: impl Read) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let _ = pipe.read_to_end(&mut buf);
-    buf
+struct Capture {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    eof: mpsc::Receiver<()>,
 }
 
-fn join_pipe(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default()
+// Keeps draining past the cap, so the writer does not die on a closed pipe.
+fn capture(mut pipe: impl Read + Send + 'static) -> Capture {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let (done, eof) = mpsc::channel::<()>();
+    let shared = Arc::clone(&bytes);
+    thread::spawn(move || {
+        let _done = done;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let mut kept = shared.lock().expect("capture");
+                    let room = MAX_CAPTURE.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..count.min(room)]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    Capture { bytes, eof }
+}
+
+fn collect(capture: Option<Capture>) -> Vec<u8> {
+    let Some(capture) = capture else {
+        return Vec::new();
+    };
+    let _ = capture.eof.recv_timeout(PIPE_GRACE);
+    let bytes = std::mem::take(&mut *capture.bytes.lock().expect("capture"));
+    bytes
 }
 
 fn kill_tree(child: &mut Child) {
