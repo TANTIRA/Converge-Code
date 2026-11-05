@@ -347,3 +347,45 @@ fn the_commit_hook_can_block_a_merge() {
     assert!(!fixture.repo.join("child.txt").exists());
     assert_eq!(status_of_alpha(&dir), "done");
 }
+
+// The script stands in for a child's model loop, using the same files and environment.
+#[cfg(unix)]
+fn child_asks_script() -> &'static str {
+    r#"#!/bin/sh
+printf '%s' "$CONVERGE_CHILD_PERMISSION" > mode.txt
+mkdir -p "$CONVERGE_CHILD_ASKS"
+printf '{"child":"%s","name":"shell","arguments":"{}"}' "$CONVERGE_CHILD_ID" > "$CONVERGE_CHILD_ASKS/q.ask"
+for attempt in $(seq 1 200); do
+  [ -f "$CONVERGE_CHILD_ASKS/q.answer" ] && break
+  sleep 0.05
+done
+cp "$CONVERGE_CHILD_ASKS/q.answer" answer.txt
+"#
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_starts_in_the_parent_mode_and_is_stopped_without_a_terminal() {
+    let fixture = Fixture::new("asks");
+    fs::write(fixture.base.join("bin").join("hermes"), child_asks_script()).unwrap();
+    let dir = fixture.write_workflow(r#"[{"op":"agent","id":"alpha","goal":"a"}]"#);
+    assert!(fixture
+        .converge(&["mode", "permission", "ask-each"])
+        .status
+        .success());
+    let run = fixture.converge(&["workflow", "--test", "test -f file.txt"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let worktree = fixture.worktree(&dir, "alpha");
+    assert_eq!(
+        fs::read_to_string(worktree.join("mode.txt")).unwrap(),
+        "ask-each"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("answer.txt")).unwrap(),
+        "stop"
+    );
+}

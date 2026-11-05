@@ -1,6 +1,7 @@
-use std::io::{self, Write};
-use std::path::Path;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
+use crate::child_ask::{self, Answer};
 use crate::error::{Error, Result};
 use crate::git;
 use crate::home;
@@ -39,8 +40,10 @@ pub fn print_tasks(cwd: &Path) -> Result<i32> {
 }
 
 pub fn run_workflow_cli(cwd: &Path, test_command: &str) -> Result<i32> {
+    crate::run::exit_on_interrupt();
     let session = open_session(cwd)?;
     let bin = std::env::current_exe().map_err(|error| Error::new(error.to_string()))?;
+    answer_children(child_ask::asks_dir(&session.dir));
     if !workflow::execute(&session, &session.workspace, &bin, test_command)? {
         eprintln!("a workflow child did not pass its completion command");
         return Ok(1);
@@ -56,6 +59,34 @@ pub fn run_workflow_cli(cwd: &Path, test_command: &str) -> Result<i32> {
         }),
     )?;
     Ok(output.status)
+}
+
+// The thread ends with the process. A workflow without a terminal has nobody to ask.
+fn answer_children(dir: PathBuf) {
+    std::thread::spawn(move || loop {
+        for ask in child_ask::pending(&dir) {
+            let answer = if io::stdin().is_terminal() {
+                prompt_for(&ask).unwrap_or(Answer::Stop)
+            } else {
+                Answer::Stop
+            };
+            let _ = child_ask::answer(&dir, &ask.id, answer);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+}
+
+fn prompt_for(ask: &child_ask::Ask) -> Result<Answer> {
+    let call = crate::tty::describe_call(&ask.name, &ask.arguments);
+    eprintln!("child {} asks to run {}:", ask.child, ask.name);
+    eprintln!("{}", crate::tty::printable_text(&call));
+    eprint!("allow? type y and Enter, anything else denies: ");
+    let reply = crate::secret::read_reply()?;
+    Ok(if reply.eq_ignore_ascii_case("y") {
+        Answer::Allow
+    } else {
+        Answer::Deny
+    })
 }
 
 pub fn merge_child_cli(cwd: &Path, id: &str, test_command: &str) -> Result<i32> {

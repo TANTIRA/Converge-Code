@@ -12,7 +12,7 @@ A delegation message carries the goal and the worktree path. That message does n
 
 An async child does not block typing in the parent. The parent's `/goal` stays set. The child's result enters the transcript on a later turn.
 
-A permission the child requests appears in the parent thread, or in the focused IDE client.
+A permission the child requests appears in the parent thread, or in the focused IDE client. A child starts in the parent's permission mode. It writes the question to `asks/` in the parent's session directory and waits for the answer. A terminal chat shows it between the parent's turns. `converge workflow` asks on its terminal. Without a terminal the child stops with a non-zero code. A child that gets no answer within an hour also stops.
 
 Ctrl-B moves the running turn to the background when the terminal supports it. When it does not, the task is still visible through `/tasks`.
 

@@ -88,13 +88,19 @@ pub fn open(home: &Path, workspace: &Workspace) -> Result<Session> {
 }
 
 pub fn open_for_print(home: &Path, workspace: &Workspace, goal: Option<String>) -> Result<Session> {
-    let Some(mut session) = load_unfinished(home, workspace)? else {
-        return create(home, workspace, goal, budget_from_env()?);
+    let mut session = match load_unfinished(home, workspace)? {
+        Some(mut session) => {
+            if let Some(goal) = goal {
+                set_goal(&mut session, goal)?;
+            }
+            apply_budget_env(&mut session)?;
+            session
+        }
+        None => create(home, workspace, goal, budget_from_env()?)?,
     };
-    if let Some(goal) = goal {
-        set_goal(&mut session, goal)?;
+    if let Ok(mode) = std::env::var(crate::child_ask::PERMISSION_ENV) {
+        set_permission_mode(&mut session, &mode)?;
     }
-    apply_budget_env(&mut session)?;
     Ok(session)
 }
 

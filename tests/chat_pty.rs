@@ -248,3 +248,78 @@ fn a_background_task_runs_a_child_and_reports_on_a_later_turn() {
     }
     let _ = fs::remove_dir_all(&base);
 }
+
+// A real chat answers a question written the way a child writes it.
+#[test]
+fn chat_shows_a_child_question_with_its_command_and_answers_it() {
+    let base = std::env::temp_dir().join(format!("converge-pty-ask-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    let home = base.join("home");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+
+    let (mut master, replica) = open_terminal();
+    let mut output = master.try_clone().unwrap();
+    let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&screen);
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(count) = output.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            seen.lock().unwrap().extend_from_slice(&chunk[..count]);
+        }
+    });
+    let stdin = Stdio::from(OwnedFd::from(replica.try_clone().unwrap()));
+    let stdout = Stdio::from(OwnedFd::from(replica));
+    let mut chat = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env_remove("CONVERGE_BASE_URL")
+        .env_remove("CONVERGE_PROVIDER")
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    eventually("session starts", || find(&home, "session.json").is_some());
+    let asks = converge::asks_dir(find(&home, "session.json").unwrap().parent().unwrap());
+    thread::sleep(Duration::from_millis(200));
+
+    let ask = |reply: &'static [u8], master: &mut File| {
+        let dir = asks.clone();
+        let child = thread::spawn(move || {
+            converge::child_ask(&dir, "alpha", "shell", r#"{"command":"rm -rf build"}"#).unwrap()
+        });
+        let shown = || String::from_utf8_lossy(&screen.lock().unwrap()).contains("allow shell?");
+        eventually("the prompt appears", shown);
+        master.write_all(reply).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        master.write_all(b"\r").unwrap();
+        let answer = child.join().unwrap();
+        let text = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+        assert!(text.contains("child alpha"), "{text}");
+        assert!(text.contains("rm -rf build"), "{text}");
+        screen.lock().unwrap().clear();
+        answer
+    };
+    assert_eq!(ask(b"y", &mut master), converge::Answer::Allow);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(ask(b"n", &mut master), converge::Answer::Deny);
+
+    master.write_all(b"/quit\r").unwrap();
+    let started = Instant::now();
+    while chat.try_wait().unwrap().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(5), "/quit");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = fs::remove_dir_all(&base);
+}

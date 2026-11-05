@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::child_ask::{self, Answer};
 use crate::cli::Args;
 use crate::edit;
 use crate::error::Result;
@@ -182,7 +183,23 @@ fn execute(
             return Ok(1);
         }
         for call in &turn.tool_calls {
-            if let Some(code) = modes::unattended_exit(session, &call.name, &call.arguments) {
+            let answer = ask_parent(session, &call.name, &call.arguments)?;
+            if answer == Some(Answer::Deny) {
+                let text = format!("{} denied", call.name);
+                messages.push(json!({"role": "tool", "tool_call_id": call.id, "content": &text}));
+                session::append(
+                    session,
+                    &json!({"kind": "denied", "name": call.name, "tool_call_id": call.id, "text": text}),
+                )?;
+                continue;
+            }
+            let allowed = answer == Some(Answer::Allow);
+            let exit = if allowed {
+                None
+            } else {
+                modes::unattended_exit(session, &call.name, &call.arguments)
+            };
+            if let Some(code) = exit {
                 session::append(session, &json!({"kind": "denied", "name": call.name}))?;
                 eprintln!(
                     "{} needs permission, and there is no terminal to ask (permission mode {}). Change it with converge mode permission <mode>.",
@@ -190,7 +207,7 @@ fn execute(
                 );
                 return Ok(code);
             }
-            let result = dispatch(session, &call.name, &call.arguments, false);
+            let result = dispatch(session, &call.name, &call.arguments, allowed);
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -241,9 +258,21 @@ pub(crate) fn dispatch(session: &Session, name: &str, arguments: &str, tty: bool
     }
 }
 
+// A child has no terminal, so what would ask goes to the parent instead.
+fn ask_parent(session: &Session, name: &str, arguments: &str) -> Result<Option<Answer>> {
+    let Ok(dir) = std::env::var(child_ask::ASKS_ENV) else {
+        return Ok(None);
+    };
+    if !modes::would_ask(session, name) {
+        return Ok(None);
+    }
+    let child = std::env::var(child_ask::ID_ENV).unwrap_or_default();
+    child_ask::ask(Path::new(&dir), &child, name, arguments).map(Some)
+}
+
 // A command runs in its own process group, so Ctrl-C reaches only Converge. The shell
 // loop kills that group on stop, and this exit also ends a blocked model request.
-fn exit_on_interrupt() {
+pub(crate) fn exit_on_interrupt() {
     crate::tty::install_cancel_handler();
     thread::spawn(|| loop {
         if crate::shell::stop_requested() {

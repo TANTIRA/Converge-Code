@@ -1,5 +1,6 @@
 mod backend;
 mod checker;
+mod child_ask;
 mod cli;
 mod command;
 mod edit;
@@ -30,6 +31,10 @@ mod workflow;
 mod worktree;
 
 pub use backend::{reply as backend_reply, selected as selected_backend, use_backend};
+pub use child_ask::{
+    answer as answer_child_ask, ask as child_ask, asks_dir, pending as pending_child_asks, Answer,
+    ASKS_ENV, ID_ENV, PERMISSION_ENV,
+};
 pub use cli::{Args, Invocation};
 pub use command::{
     list_providers_cli, merge_child_cli, mmdp_put_laptop, print_tasks, run_workflow_cli,

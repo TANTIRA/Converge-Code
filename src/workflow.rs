@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::child_ask;
 use crate::error::{Error, Result};
 use crate::git::{self, Workspace};
 use crate::session::Session;
@@ -20,6 +21,8 @@ struct Children<'a> {
     repo: &'a Path,
     root: PathBuf,
     session_id: &'a str,
+    session_dir: &'a Path,
+    permission_mode: &'a str,
     bin: &'a Path,
     test_command: &'a str,
 }
@@ -47,6 +50,8 @@ pub fn execute(session: &Session, repo: &Path, bin: &Path, test_command: &str) -
         repo,
         root: worktree_root(session, repo)?,
         session_id: &session.id,
+        session_dir: &session.dir,
+        permission_mode: &session.permission_mode,
         bin,
         test_command,
     };
@@ -114,9 +119,10 @@ pub fn start_background(
     let bin = bin.to_path_buf();
     let goal = goal.to_string();
     let test_command = test_command.to_string();
+    let envs = child_envs(&session.dir, &session.permission_mode, &id, None);
     Ok(thread::spawn(move || {
         // Esc cancels the parent's turn, not a task the user sent to the background.
-        let passed = run_child(&bin, &dest, &goal, &test_command, None, false);
+        let passed = run_child(&bin, &dest, &goal, &test_command, &envs, false);
         let _guard = TASKS.lock().expect("tasks");
         let Ok(mut all) = read_tasks(&tasks) else {
             return;
@@ -455,14 +461,38 @@ fn run_agent(children: &Children, step: &Value, order: &mut Vec<String>) -> Resu
         worktree::add(children.repo, &dest, &branch_name(children.session_id, id))?;
     }
     order.push(format!("agent {id}"));
+    let envs = child_envs(
+        children.session_dir,
+        children.permission_mode,
+        id,
+        step["model"].as_str(),
+    );
     Ok(run_child(
         children.bin,
         &dest,
         step["goal"].as_str().unwrap_or(""),
         children.test_command,
-        step["model"].as_str(),
+        &envs,
         true,
     ))
+}
+
+fn child_envs(
+    session_dir: &Path,
+    permission_mode: &str,
+    id: &str,
+    model: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let asks = child_ask::asks_dir(session_dir);
+    let mut envs = vec![
+        (child_ask::ASKS_ENV, asks.to_string_lossy().into_owned()),
+        (child_ask::PERMISSION_ENV, permission_mode.to_string()),
+        (child_ask::ID_ENV, id.to_string()),
+    ];
+    if let Some(model) = model {
+        envs.push(("CONVERGE_MODEL", model.to_string()));
+    }
+    envs
 }
 
 // The child is a whole session. Only its completion command can make it pass.
@@ -471,11 +501,11 @@ fn run_child(
     worktree: &Path,
     goal: &str,
     test_command: &str,
-    model: Option<&str>,
+    envs: &[(&str, String)],
     cancellable: bool,
 ) -> bool {
     let arguments = ["-p", goal, "--goal", goal, "--test", test_command].map(str::to_string);
-    shell::run_child(worktree, bin, &arguments, model, CHILD_TIMEOUT, cancellable)
+    shell::run_child(worktree, bin, &arguments, envs, CHILD_TIMEOUT, cancellable)
         .is_ok_and(|output| output.status == 0)
 }
 

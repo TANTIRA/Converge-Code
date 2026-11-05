@@ -563,3 +563,31 @@ fn sandbox_keeps_commands_out_of_secrets_weights_hooks_and_the_socket() {
     drop(server);
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn a_child_question_reaches_the_parent_and_gets_one_answer() {
+    let dir = TempDir::new("converge-asks");
+    for (reply, expected) in [
+        (converge::Answer::Allow, converge::Answer::Allow),
+        (converge::Answer::Deny, converge::Answer::Deny),
+        (converge::Answer::Stop, converge::Answer::Stop),
+    ] {
+        let asks = dir.path().to_path_buf();
+        let child = std::thread::spawn(move || {
+            converge::child_ask(&asks, "alpha", "shell", r#"{"command":"pwd"}"#).unwrap()
+        });
+        let ask = loop {
+            if let Some(ask) = converge::pending_child_asks(dir.path()).pop() {
+                break ask;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(ask.child, "alpha");
+        assert_eq!(ask.name, "shell");
+        assert!(ask.arguments.contains("pwd"));
+        converge::answer_child_ask(dir.path(), &ask.id, reply).unwrap();
+        assert!(converge::pending_child_asks(dir.path()).is_empty());
+        assert_eq!(child.join().unwrap(), expected);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}

@@ -255,6 +255,13 @@ fn wrap(text: &str, cols: usize) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn printable_text(text: &str) -> String {
+    text.split('\n')
+        .map(|line| printable(line).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // Model and tool text must not reach the terminal as control codes.
 fn printable(text: &str) -> impl Iterator<Item = char> + '_ {
     text.chars()
@@ -297,6 +304,11 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
                 &status,
             ))?;
             dirty = false;
+        }
+        // shortcut: a child waits while the parent's own turn runs; upgrade by polling inside chat_reply too.
+        if answer_children(&session, home, &mut view)? {
+            dirty = true;
+            continue;
         }
         if let Some(line) = crate::uhp::poll_input() {
             dirty = true;
@@ -357,6 +369,27 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
             }
         }
     }
+}
+
+fn answer_children(session: &Session, home: &Path, view: &mut Vec<String>) -> Result<bool> {
+    let dir = crate::child_ask::asks_dir(&session.dir);
+    let asks = crate::child_ask::pending(&dir);
+    for ask in &asks {
+        view.push(format!("child {}:", ask.child));
+        let allowed = confirm_tool(&ask.name, &ask.arguments, view, session, home)?;
+        let answer = if allowed {
+            crate::child_ask::Answer::Allow
+        } else {
+            crate::child_ask::Answer::Deny
+        };
+        view.push(format!(
+            "{} {}",
+            ask.name,
+            if allowed { "allowed" } else { "denied" }
+        ));
+        crate::child_ask::answer(&dir, &ask.id, answer)?;
+    }
+    Ok(!asks.is_empty())
 }
 
 fn submit_line(
@@ -808,7 +841,7 @@ fn chat_reply(
 }
 
 // shortcut: a call taller than the screen shows only its end; upgrade when the view can scroll.
-fn describe_call(name: &str, arguments: &str) -> String {
+pub(crate) fn describe_call(name: &str, arguments: &str) -> String {
     let parsed: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
     let field = |key: &str| parsed.get(key).and_then(|value| value.as_str());
     match (name, field("command"), field("path")) {

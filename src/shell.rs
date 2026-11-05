@@ -82,16 +82,14 @@ pub(crate) fn run_child(
     cwd: &Path,
     bin: &Path,
     args: &[String],
-    model: Option<&str>,
+    envs: &[(&str, String)],
     timeout: Duration,
     cancellable: bool,
 ) -> Result<CommandOutput> {
     let mut process = Command::new(bin);
     prepare(&mut process, cwd);
     process.args(args);
-    if let Some(model) = model {
-        process.env("CONVERGE_MODEL", model);
-    }
+    process.envs(envs.iter().map(|(name, value)| (*name, value)));
     finish(&bin.to_string_lossy(), process, timeout, cancellable)
 }
 
@@ -111,6 +109,9 @@ fn prepare(process: &mut Command, cwd: &Path) {
 // Only the model's shell loses the keys. A backend CLI is the user's and needs its own.
 fn remove_provider_keys(process: &mut Command) {
     process.env_remove("CONVERGE_API_KEY");
+    process.env_remove(crate::child_ask::ASKS_ENV);
+    process.env_remove(crate::child_ask::ID_ENV);
+    process.env_remove(crate::child_ask::PERMISSION_ENV);
     if let Ok(home) = home::converge_home() {
         for name in provider::secret_envs(&home) {
             process.env_remove(name);
