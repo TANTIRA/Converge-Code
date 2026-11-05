@@ -1,5 +1,6 @@
 use std::path::Path;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -10,7 +11,7 @@ use crate::git;
 use crate::home;
 use crate::instructions;
 use crate::mcp;
-use crate::model::{self, Model};
+use crate::model::{self, OpenAiCompatible};
 use crate::modes;
 use crate::session::{self, Budget, Session};
 
@@ -21,6 +22,15 @@ pub fn stop_allowed(test_status: i32) -> bool {
 }
 
 pub fn run_print(cwd: &Path, args: &Args) -> Result<i32> {
+    exit_on_interrupt();
+    let result = print_session(cwd, args);
+    if crate::shell::stop_requested() {
+        return Ok(130);
+    }
+    result
+}
+
+fn print_session(cwd: &Path, args: &Args) -> Result<i32> {
     let home = home::converge_home()?;
     if crate::backend::selected(&home)? != "converge" {
         return crate::backend::run_external(
@@ -38,19 +48,7 @@ pub fn run_print(cwd: &Path, args: &Args) -> Result<i32> {
         Some(&instructions::organization_instructions()),
         Some(&instructions::user_instructions(&home)),
     )?;
-    let mut session = match session::load_unfinished(&home, &workspace)? {
-        Some(mut existing) => {
-            if let Some(goal) = args.goal.clone() {
-                session::set_goal(&mut existing, goal)?;
-            }
-            session::apply_budget_env(&mut existing)?;
-            existing
-        }
-        None => {
-            let budget = session::budget_from_env()?;
-            session::create(&home, &workspace, args.goal.clone(), budget)?
-        }
-    };
+    let mut session = session::open_for_print(&home, &workspace, args.goal.clone())?;
     let mut messages = vec![
         json!({
             "role": "system",
@@ -88,7 +86,7 @@ pub fn run_print(cwd: &Path, args: &Args) -> Result<i32> {
 }
 
 fn execute(
-    model: &mut dyn Model,
+    model: &mut OpenAiCompatible,
     session: &mut Session,
     home: &Path,
     messages: &mut Vec<Value>,
@@ -119,7 +117,7 @@ fn execute(
             tokens,
             seconds: base_seconds.saturating_add(started.elapsed().as_secs()),
         };
-        session::store_used(session)?;
+        session::save(session)?;
         messages.push(turn.assistant_message.clone());
         session::append(
             session,
@@ -137,29 +135,36 @@ fn execute(
             return out_of_budget(session);
         }
         if turn.tool_calls.is_empty() {
-            let output = modes::run_session_shell(session, test_command)?;
-            session::append(
-                session,
-                &json!({
-                    "kind": "test",
-                    "status": output.status,
-                    "stdout": clip(&output.stdout),
-                    "stderr": clip(&output.stderr),
-                }),
-            )?;
-            if stop_allowed(output.status) {
-                if session.work_mode == "debug" {
-                    session.source_closed = true;
-                    session::save(session)?;
+            let text = match modes::run_session_shell(session, test_command) {
+                Ok(output) => {
+                    session::append(
+                        session,
+                        &json!({
+                            "kind": "test",
+                            "status": output.status,
+                            "stdout": clip(&output.stdout),
+                            "stderr": clip(&output.stderr),
+                        }),
+                    )?;
+                    if stop_allowed(output.status) {
+                        if session.work_mode == "debug" {
+                            session.source_closed = true;
+                            session::save(session)?;
+                        }
+                        return Ok(0);
+                    }
+                    format!(
+                        "Completion command exited with status {}.\nstdout:\n{}\nstderr:\n{}",
+                        output.status,
+                        clip(&output.stdout),
+                        clip(&output.stderr)
+                    )
                 }
-                return Ok(0);
-            }
-            let text = format!(
-                "Completion command exited with status {}.\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                clip(&output.stdout),
-                clip(&output.stderr)
-            );
+                Err(error) => {
+                    session::append(session, &json!({"kind": "test", "error": error.message}))?;
+                    format!("Completion command did not finish: {}", error.message)
+                }
+            };
             messages.push(json!({"role": "user", "content": text}));
             session::append(
                 session,
@@ -228,8 +233,22 @@ pub(crate) fn dispatch(session: &Session, name: &str, arguments: &str, tty: bool
                 Err(error) => error.message,
             }
         }
-        _ => format!("mcp tool {name}"),
+        // No MCP client exists yet, so say that nothing ran rather than report a success.
+        _ => format!("error: {name} is not connected, and nothing was run"),
     }
+}
+
+// A command runs in its own process group, so Ctrl-C reaches only Converge. The shell
+// loop kills that group on stop, and this exit also ends a blocked model request.
+fn exit_on_interrupt() {
+    crate::tty::install_cancel_handler();
+    thread::spawn(|| loop {
+        if crate::shell::stop_requested() {
+            thread::sleep(Duration::from_millis(200));
+            std::process::exit(130);
+        }
+        thread::sleep(Duration::from_millis(50));
+    });
 }
 
 fn system_prompt(instructions: &str, test_command: &str, goal: Option<&str>) -> String {

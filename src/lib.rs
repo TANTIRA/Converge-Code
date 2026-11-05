@@ -19,6 +19,8 @@ mod run;
 mod secret;
 mod session;
 mod shell;
+#[cfg(unix)]
+mod termios;
 mod tty;
 mod uhp;
 mod weights;
@@ -52,7 +54,7 @@ pub use provider::{
 pub use run::{run_print, stop_allowed};
 pub use session::{
     create as create_session, load_unfinished, save as save_session, set_goal, set_permission_mode,
-    set_work_mode, store_used, Budget, Session, Usage, DEFAULT_STEP_BUDGET,
+    set_work_mode, Budget, Session, Usage, DEFAULT_STEP_BUDGET,
 };
 pub use shell::{
     clear_stop as clear_shell_cancel, request_stop as cancel_shell, run as run_shell,

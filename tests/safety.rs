@@ -314,3 +314,170 @@ fn chat_frame_wraps_long_lines_and_strips_control_codes() {
     assert!(!frame.contains('\r'));
     assert!(frame.contains("safe"));
 }
+
+#[cfg(unix)]
+fn install_backend(user_home: &Path, script: &str) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    let converge_home = user_home.join(".converge");
+    fs::create_dir_all(&converge_home).unwrap();
+    converge::use_backend(&converge_home, "hermes").unwrap();
+    let bin = user_home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("hermes");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut search = std::ffi::OsString::from(&bin);
+    search.push(":");
+    search.push(std::env::var_os("PATH").unwrap_or_default());
+    search
+}
+
+#[cfg(unix)]
+#[test]
+fn a_backend_keeps_its_api_key_and_the_shell_does_not() {
+    let repo = git_repo();
+    let user_home = TempDir::new("converge-user");
+    let search = install_backend(
+        user_home.path(),
+        "#!/bin/sh\nprintf 'key=%s\\n' \"$ANTHROPIC_API_KEY\"\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["-p", "hi", "--test", "test -z \"$ANTHROPIC_API_KEY\""])
+        .current_dir(repo.path())
+        .env("HOME", user_home.path())
+        .env("PATH", &search)
+        .env("ANTHROPIC_API_KEY", "backend-secret")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let transcript = find_transcript(user_home.path());
+    assert!(fs::read_to_string(transcript)
+        .unwrap()
+        .contains("key=backend-secret"));
+}
+
+#[cfg(unix)]
+fn find_transcript(root: &Path) -> PathBuf {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.ends_with("transcript.jsonl") {
+                return path;
+            }
+        }
+    }
+    panic!("no transcript under {}", root.display());
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_on_a_print_run_stops_the_running_command() {
+    let repo = git_repo();
+    let user_home = TempDir::new("converge-user");
+    let marker = format!("{}", 40000 + std::process::id() % 20000);
+    let search = install_backend(user_home.path(), &format!("#!/bin/sh\nsleep {marker}\n"));
+    let mut run = Command::new(env!("CARGO_BIN_EXE_converge"))
+        .args(["-p", "hi", "--test", "true"])
+        .current_dir(repo.path())
+        .env("HOME", user_home.path())
+        .env("PATH", &search)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let running = || {
+        Command::new("pgrep")
+            .args(["-f", &format!("sleep {marker}")])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    let started = std::time::Instant::now();
+    while !running() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(Command::new("kill")
+        .args(["-INT", &run.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(run.wait().unwrap().code(), Some(130));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!running());
+}
+
+#[cfg(unix)]
+#[test]
+fn converge_home_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = git_repo();
+    let base = TempDir::new("converge-user");
+    let home = base.path().join(".converge");
+    let workspace = converge::identify(repo.path()).unwrap();
+    converge::create_session(&home, &workspace, None, budget()).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+    converge::load_unfinished(&home, &workspace).unwrap();
+    let mode = fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_client_that_stops_reading_does_not_stall_the_others() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let repo = git_repo();
+    let base = PathBuf::from(format!("/tmp/cvs{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let home = base.join(".converge");
+    let workspace = converge::identify(repo.path()).unwrap();
+    let session = converge::create_session(&home, &workspace, None, budget()).unwrap();
+    let server = converge::serve(&home, &session, repo.path()).unwrap();
+    let _stuck = UnixStream::connect(&server.socket).unwrap();
+    let active = UnixStream::connect(&server.socket).unwrap();
+    let mut writer = active.try_clone().unwrap();
+    active
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let mut replies = BufReader::new(active);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let text = "x".repeat(256 * 1024);
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 7, "method": "session/input", "params": {"text": text},
+    });
+    writeln!(writer, "{request}").unwrap();
+    let started = std::time::Instant::now();
+    let mut reply = String::new();
+    while !reply.contains("\"id\":7") {
+        reply.clear();
+        replies.read_line(&mut reply).unwrap();
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+    // A reply goes only to the client that asked.
+    let other = UnixStream::connect(&server.socket).unwrap();
+    other
+        .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    writeln!(
+        writer,
+        r#"{{"jsonrpc":"2.0","id":8,"method":"session/status","params":{{}}}}"#
+    )
+    .unwrap();
+    reply.clear();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("\"id\":8"), "{reply}");
+    let mut overheard = String::new();
+    assert!(BufReader::new(other).read_line(&mut overheard).is_err());
+    drop(server);
+    let _ = fs::remove_dir_all(&base);
+}

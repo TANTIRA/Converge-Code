@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -10,6 +11,8 @@ use crate::session::{self, Session};
 use crate::shell;
 
 const NAMES: &[&str] = &["converge", "hermes", "codex", "grokbot", "claude"];
+// A backend is a whole coding agent, so it gets far longer than one shell command.
+const BACKEND_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub fn selected(home: &Path) -> Result<String> {
     let path = home.join("backend.json");
@@ -49,7 +52,7 @@ pub fn reply(home: &Path, cwd: &Path, prompt: &str) -> Result<String> {
         cwd,
         program(&name),
         &arguments(&name, prompt),
-        shell::DEFAULT_TIMEOUT,
+        BACKEND_TIMEOUT,
     )
     .map_err(|error| {
         if error.message.contains("is not installed") {
@@ -75,24 +78,9 @@ pub fn run_external(
     test_command: &str,
     goal: Option<String>,
 ) -> Result<i32> {
-    let name = selected(home)?;
-    let text = reply(home, cwd, prompt).map_err(|error| {
-        if error.message.contains("is not installed") {
-            Error::new(format!("{name} is not installed"))
-        } else {
-            error
-        }
-    })?;
+    let text = reply(home, cwd, prompt)?;
     let workspace = git::identify(cwd)?;
-    let mut session = match session::load_unfinished(home, &workspace)? {
-        Some(mut existing) => {
-            if let Some(goal) = goal {
-                session::set_goal(&mut existing, goal)?;
-            }
-            existing
-        }
-        None => session::create(home, &workspace, goal, session::budget_from_env()?)?,
-    };
+    let mut session = session::open_for_print(home, &workspace, goal)?;
     session::append(&session, &json!({"kind": "user", "text": prompt}))?;
     let message = json!({"role": "assistant", "content": text});
     session::append(&session, &json!({"kind": "assistant", "message": message}))?;
@@ -110,11 +98,7 @@ fn finish_test(session: &mut Session, test_command: &str) -> Result<i32> {
             "stderr": output.stderr,
         }),
     )?;
-    if output.status == 0 {
-        Ok(0)
-    } else {
-        Ok(output.status)
-    }
+    Ok(output.status)
 }
 
 fn known(name: &str) -> Result<()> {

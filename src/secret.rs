@@ -3,6 +3,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+#[cfg(unix)]
+use crate::termios::{tcgetattr, tcsetattr, zero_termios, Termios};
 
 pub fn read_secret(home: &Path, name: &str) -> Result<Option<String>> {
     let path = env_path(home);
@@ -216,73 +218,6 @@ fn enable_unix() -> Result<EchoOff> {
     }
     Ok(EchoOff { fd, original })
 }
-
-#[cfg(all(unix, target_os = "macos"))]
-fn zero_termios() -> Termios {
-    Termios {
-        c_iflag: 0,
-        c_oflag: 0,
-        c_cflag: 0,
-        c_lflag: 0,
-        c_cc: [0; 20],
-        c_ispeed: 0,
-        c_ospeed: 0,
-    }
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn zero_termios() -> Termios {
-    Termios {
-        c_iflag: 0,
-        c_oflag: 0,
-        c_cflag: 0,
-        c_lflag: 0,
-        c_line: 0,
-        c_cc: [0; 32],
-        c_ispeed: 0,
-        c_ospeed: 0,
-    }
-}
-
-#[cfg(unix)]
-extern "C" {
-    fn tcgetattr(fd: i32, termios: *mut Termios) -> i32;
-    fn tcsetattr(fd: i32, optional_actions: i32, termios: *const Termios) -> i32;
-}
-
-// Platform termios ABI. Only c_lflag is changed, and the saved copy is restored on drop.
-#[cfg(all(unix, target_os = "macos"))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Termios {
-    c_iflag: u64,
-    c_oflag: u64,
-    c_cflag: u64,
-    c_lflag: u64,
-    c_cc: [u8; 20],
-    c_ispeed: u64,
-    c_ospeed: u64,
-}
-
-#[cfg(all(unix, target_os = "macos"))]
-const _: () = assert!(std::mem::size_of::<Termios>() == 72);
-
-#[cfg(all(unix, not(target_os = "macos")))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Termios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 32],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-const _: () = assert!(std::mem::size_of::<Termios>() == 60);
 
 #[cfg(windows)]
 fn enable_windows() -> Result<EchoOff> {

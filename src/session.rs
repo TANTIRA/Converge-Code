@@ -12,7 +12,7 @@ use crate::git::Workspace;
 
 pub const DEFAULT_STEP_BUDGET: u64 = 32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
     pub steps: Option<u64>,
     pub tokens: Option<u64>,
@@ -54,6 +54,7 @@ pub fn create(
         .join(&id);
     fs::create_dir_all(&dir)
         .map_err(|error| Error::new(format!("create {}: {error}", dir.display())))?;
+    crate::home::make_private(home)?;
     let session = Session {
         id,
         dir,
@@ -70,6 +71,33 @@ pub fn create(
     Ok(session)
 }
 
+pub fn open(home: &Path, workspace: &Workspace) -> Result<Session> {
+    match load_unfinished(home, workspace)? {
+        Some(session) => Ok(session),
+        None => create(
+            home,
+            workspace,
+            None,
+            Budget {
+                steps: None,
+                tokens: None,
+                seconds: None,
+            },
+        ),
+    }
+}
+
+pub fn open_for_print(home: &Path, workspace: &Workspace, goal: Option<String>) -> Result<Session> {
+    let Some(mut session) = load_unfinished(home, workspace)? else {
+        return create(home, workspace, goal, budget_from_env()?);
+    };
+    if let Some(goal) = goal {
+        set_goal(&mut session, goal)?;
+    }
+    apply_budget_env(&mut session)?;
+    Ok(session)
+}
+
 pub fn load_unfinished(home: &Path, workspace: &Workspace) -> Result<Option<Session>> {
     let sessions = home
         .join("projects")
@@ -82,6 +110,7 @@ pub fn load_unfinished(home: &Path, workspace: &Workspace) -> Result<Option<Sess
             return Err(Error::new(format!("read {}: {error}", sessions.display())));
         }
     };
+    crate::home::make_private(home)?;
     let mut newest: Option<(SystemTime, Session)> = None;
     for entry in entries {
         let entry =
@@ -117,10 +146,6 @@ pub fn load_unfinished(home: &Path, workspace: &Workspace) -> Result<Option<Sess
 pub fn set_goal(session: &mut Session, goal: String) -> Result<()> {
     session.goal = Some(goal);
     write_record(session)
-}
-
-pub fn store_used(session: &Session) -> Result<()> {
-    save(session)
 }
 
 pub fn save(session: &Session) -> Result<()> {
@@ -164,7 +189,7 @@ pub(crate) fn append_record(dir: &Path, value: &Value) -> Result<()> {
         .map_err(|error| Error::new(format!("write transcript: {error}")))
 }
 
-pub fn apply_budget_env(session: &mut Session) -> Result<()> {
+fn apply_budget_env(session: &mut Session) -> Result<()> {
     let steps = optional_u64("CONVERGE_BUDGET_STEPS")?;
     let tokens = optional_u64("CONVERGE_BUDGET_TOKENS")?;
     let seconds = optional_u64("CONVERGE_BUDGET_SECONDS")?;
@@ -247,11 +272,7 @@ fn read_session(dir: &Path) -> Result<Option<Session>> {
         dir: dir.to_path_buf(),
         workspace: PathBuf::from(record.workspace),
         goal: record.goal,
-        budget: Budget {
-            steps: record.budget.steps,
-            tokens: record.budget.tokens,
-            seconds: record.budget.seconds,
-        },
+        budget: record.budget,
         used: record.used,
         work_mode: record.work_mode,
         permission_mode: record.permission_mode,
@@ -269,11 +290,7 @@ fn write_record(session: &Session) -> Result<()> {
         source_closed: session.source_closed,
         mcp_server: session.mcp_server.clone(),
         goal: session.goal.clone(),
-        budget: BudgetRecord {
-            steps: session.budget.steps,
-            tokens: session.budget.tokens,
-            seconds: session.budget.seconds,
-        },
+        budget: session.budget,
         used: session.used,
     };
     let path = session.dir.join("session.json");
@@ -297,14 +314,7 @@ struct StoredSession {
     mcp_server: Option<String>,
     #[serde(default)]
     goal: Option<String>,
-    budget: BudgetRecord,
+    budget: Budget,
     #[serde(default)]
     used: Usage,
-}
-
-#[derive(Serialize, Deserialize)]
-struct BudgetRecord {
-    steps: Option<u64>,
-    tokens: Option<u64>,
-    seconds: Option<u64>,
 }

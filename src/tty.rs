@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::git;
 use crate::home;
-use crate::model::Model;
 use crate::modes;
-use crate::session::{self, Budget, Session};
+use crate::session::{self, Session};
+#[cfg(unix)]
+use crate::termios::{tcgetattr, tcsetattr, zero_termios, Termios};
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -57,19 +58,7 @@ pub fn run_chat(cwd: &Path) -> Result<i32> {
     install_cancel_handler();
     let workspace = git::identify(cwd)?;
     let converge_home = home::converge_home()?;
-    let mut session = match session::load_unfinished(&converge_home, &workspace)? {
-        Some(session) => session,
-        None => session::create(
-            &converge_home,
-            &workspace,
-            None,
-            Budget {
-                steps: None,
-                tokens: None,
-                seconds: None,
-            },
-        )?,
-    };
+    let mut session = session::open(&converge_home, &workspace)?;
     if session.permission_mode == "dontAsk" {
         session::set_permission_mode(&mut session, "ask-each")?;
     }
@@ -83,13 +72,8 @@ pub fn run_chat(cwd: &Path) -> Result<i32> {
     );
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    #[cfg(unix)]
     if stdin.is_terminal() && stdout.is_terminal() {
         return run_screen(&workspace, &converge_home, session);
-    }
-    #[cfg(windows)]
-    if stdin.is_terminal() && stdout.is_terminal() {
-        return windows_screen::run(&workspace, &converge_home, session);
     }
     for line in stdin.lock().lines() {
         if CANCEL.swap(false, Ordering::SeqCst) {
@@ -243,9 +227,11 @@ fn printable(text: &str) -> impl Iterator<Item = char> + '_ {
         .filter(|ch| !ch.is_control())
 }
 
-#[cfg(unix)]
 fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Session) -> Result<i32> {
+    #[cfg(unix)]
     let _raw = RawTerm::enable()?;
+    #[cfg(windows)]
+    let _console = windows_screen::Console::enable()?;
     let _screen = AltScreen::enter();
     let instructions = crate::instructions::load_scoped(
         &workspace.toplevel,
@@ -291,7 +277,7 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
             }
             continue;
         }
-        if !poll_stdin(50)? {
+        if !wait_key(50)? {
             continue;
         }
         dirty = true;
@@ -717,7 +703,7 @@ fn chat_reply(
             return Ok(0);
         }
         for call in turn.tool_calls {
-            if modes::asks(session, &call.name) {
+            if modes::would_ask(session, &call.name) {
                 let allowed = confirm_tool(&call.name, &call.arguments, view, session, home)?;
                 if !allowed {
                     let text = format!("{} denied", call.name);
@@ -1081,10 +1067,8 @@ impl Drop for RawTerm {
     }
 }
 
-#[cfg(unix)]
 struct AltScreen;
 
-#[cfg(unix)]
 impl AltScreen {
     fn enter() -> Self {
         let mut stdout = io::stdout();
@@ -1094,7 +1078,6 @@ impl AltScreen {
     }
 }
 
-#[cfg(unix)]
 impl Drop for AltScreen {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
@@ -1125,89 +1108,17 @@ fn set_raw_cc(termios: &mut Termios) {
     termios.c_cc[5] = 0;
 }
 
-#[cfg(all(unix, target_os = "macos"))]
-fn zero_termios() -> Termios {
-    Termios {
-        c_iflag: 0,
-        c_oflag: 0,
-        c_cflag: 0,
-        c_lflag: 0,
-        c_cc: [0; 20],
-        c_ispeed: 0,
-        c_ospeed: 0,
-    }
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn zero_termios() -> Termios {
-    Termios {
-        c_iflag: 0,
-        c_oflag: 0,
-        c_cflag: 0,
-        c_lflag: 0,
-        c_line: 0,
-        c_cc: [0; 32],
-        c_ispeed: 0,
-        c_ospeed: 0,
-    }
-}
-
-#[cfg(unix)]
-extern "C" {
-    fn tcgetattr(fd: i32, termios: *mut Termios) -> i32;
-    fn tcsetattr(fd: i32, optional_actions: i32, termios: *const Termios) -> i32;
-}
-
-#[cfg(all(unix, target_os = "macos"))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Termios {
-    c_iflag: u64,
-    c_oflag: u64,
-    c_cflag: u64,
-    c_lflag: u64,
-    c_cc: [u8; 20],
-    c_ispeed: u64,
-    c_ospeed: u64,
-}
-
-#[cfg(all(unix, target_os = "macos"))]
-const _: () = assert!(std::mem::size_of::<Termios>() == 72);
-
-#[cfg(all(unix, not(target_os = "macos")))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Termios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 32],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-const _: () = assert!(std::mem::size_of::<Termios>() == 60);
-
 #[cfg(windows)]
 mod windows_screen {
     use std::ffi::c_void;
-    use std::io::{self, Write};
-    use std::path::Path;
 
-    use super::{
-        chat_prompt, decode_key, extend_messages, load_view, paint, raw_console_modes,
-        render_chat_frame, status_line, Key, CANCEL,
-    };
+    use super::{decode_key, raw_console_modes, Key};
     use crate::error::{Error, Result};
-    use crate::session::{self, Session};
 
     const STD_INPUT: u32 = 0xFFFF_FFF6;
     const STD_OUTPUT: u32 = 0xFFFF_FFF5;
 
-    struct Console {
+    pub(super) struct Console {
         input: *mut c_void,
         output: *mut c_void,
         input_mode: u32,
@@ -1215,7 +1126,7 @@ mod windows_screen {
     }
 
     impl Console {
-        fn enable() -> Result<Self> {
+        pub(super) fn enable() -> Result<Self> {
             let input = handle(STD_INPUT)?;
             let output = handle(STD_OUTPUT)?;
             let input_mode = mode(input)?;
@@ -1244,117 +1155,6 @@ mod windows_screen {
             unsafe {
                 SetConsoleMode(self.input, self.input_mode);
                 SetConsoleMode(self.output, self.output_mode);
-            }
-        }
-    }
-
-    struct AltScreen;
-
-    impl AltScreen {
-        fn enter() -> Self {
-            let mut stdout = io::stdout();
-            let _ = write!(stdout, "\u{1b}[?1049h\u{1b}[?25h");
-            let _ = stdout.flush();
-            Self
-        }
-    }
-
-    impl Drop for AltScreen {
-        fn drop(&mut self) {
-            let mut stdout = io::stdout();
-            let _ = write!(stdout, "\u{1b}[?1049l\u{1b}[?25h");
-            let _ = stdout.flush();
-        }
-    }
-
-    pub fn run(
-        workspace: &crate::git::Workspace,
-        home: &Path,
-        mut session: Session,
-    ) -> Result<i32> {
-        let _console = Console::enable()?;
-        let _screen = AltScreen::enter();
-        let instructions = crate::instructions::load_scoped(
-            &workspace.toplevel,
-            Some(&crate::instructions::organization_instructions()),
-            Some(&crate::instructions::user_instructions(home)),
-        )?;
-        let mut view = load_view(&session);
-        let mut messages = vec![serde_json::json!({
-            "role": "system",
-            "content": chat_prompt(&instructions, session.goal.as_deref()),
-        })];
-        extend_messages(&mut messages, &session);
-        let mut input = String::new();
-        let mut model = crate::model::OpenAiCompatible::open(home).ok();
-        let mut dirty = true;
-        loop {
-            if CANCEL.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                return Ok(130);
-            }
-            if dirty {
-                let status = status_line(&session, home, model.is_some());
-                let (rows, cols) = window_size();
-                paint(&render_chat_frame(rows, cols, &view, &input, &status))?;
-                dirty = false;
-            }
-            if let Some(line) = crate::uhp::poll_input() {
-                dirty = true;
-                if let Some(code) = super::submit_line(
-                    &mut session,
-                    home,
-                    &mut model,
-                    &mut messages,
-                    &mut view,
-                    line,
-                    true,
-                )? {
-                    return Ok(code);
-                }
-                continue;
-            }
-            if !pending(50) {
-                continue;
-            }
-            dirty = true;
-            match read_key()? {
-                Key::Char(ch) => input.push(ch),
-                Key::Backspace => {
-                    input.pop();
-                }
-                Key::Esc => input.clear(),
-                Key::Ignore => {}
-                Key::ShiftTab => {
-                    let next = crate::modes::cycle_permission(&session.permission_mode);
-                    session::set_permission_mode(&mut session, next)?;
-                    crate::uhp::publish(
-                        "session/status",
-                        serde_json::json!({
-                            "work_mode": session.work_mode,
-                            "permission_mode": session.permission_mode,
-                        }),
-                    );
-                }
-                Key::CtrlC => return Ok(130),
-                Key::CtrlD => {
-                    if input.is_empty() {
-                        return Ok(0);
-                    }
-                }
-                Key::Enter => {
-                    let line = std::mem::take(&mut input);
-                    if let Some(code) = super::submit_line(
-                        &mut session,
-                        home,
-                        &mut model,
-                        &mut messages,
-                        &mut view,
-                        line,
-                        false,
-                    )? {
-                        return Ok(code);
-                    }
-                }
             }
         }
     }

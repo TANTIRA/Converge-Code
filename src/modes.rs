@@ -148,11 +148,7 @@ fn record_changed(path: &std::path::Path, snapshot: &[u8]) -> bool {
     }
 }
 
-pub fn asks(session: &Session, name: &str) -> bool {
-    would_ask(session, name)
-}
-
-fn would_ask(session: &Session, name: &str) -> bool {
+pub(crate) fn would_ask(session: &Session, name: &str) -> bool {
     match session.permission_mode.as_str() {
         "dontAsk" | "auto" => false,
         "accept-edits" => name == "shell",

@@ -242,7 +242,7 @@ fn exhausted_resume_exits_nonzero_without_a_new_session_or_lesson() {
     )
     .expect("session");
     session.used.steps = 1;
-    converge::store_used(&session).expect("used");
+    converge::save_session(&session).expect("used");
     let loaded = converge::load_unfinished(&home, &workspace)
         .expect("load")
         .expect("stored session");

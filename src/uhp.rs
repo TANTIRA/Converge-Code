@@ -14,8 +14,9 @@ use crate::session::Session;
 static CURRENT: Mutex<Option<Arc<Hub>>> = Mutex::new(None);
 
 struct Hub {
-    emit: Box<dyn Fn(&str, bool) + Send + Sync>,
-    focus_on: Box<dyn Fn(u64) + Send + Sync>,
+    // Sends one line to one client, or to all of them when the target is None.
+    emit: Box<dyn Fn(&str, Option<u64>) + Send + Sync>,
+    focused: Mutex<Option<u64>>,
     inputs: Mutex<VecDeque<String>>,
     permit: Mutex<Option<bool>>,
     asking: AtomicU64,
@@ -30,11 +31,18 @@ impl Hub {
     }
 
     fn focus(&self, id: u64) {
-        (self.focus_on)(id);
+        *self.focused.lock().expect("uhp") = Some(id);
     }
 
-    fn raw(&self, line: &str) {
-        (self.emit)(line, false);
+    fn forget(&self, id: u64) {
+        let mut focused = self.focused.lock().expect("uhp");
+        if *focused == Some(id) {
+            *focused = None;
+        }
+    }
+
+    fn reply(&self, id: u64, line: &str) {
+        (self.emit)(line, Some(id));
     }
 
     fn note(&self, method: &str, mut params: Value, focused: bool) {
@@ -44,7 +52,11 @@ impl Hub {
                 .or_insert_with(|| json!(self.session_id));
         }
         let line = json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string();
-        (self.emit)(&line, focused);
+        if !focused {
+            (self.emit)(&line, None);
+        } else if let Some(id) = *self.focused.lock().expect("uhp") {
+            (self.emit)(&line, Some(id));
+        }
     }
 
     fn push_input(&self, text: &str) {
@@ -63,12 +75,11 @@ impl Hub {
     #[cfg(windows)]
     pub(super) fn new(
         session_id: String,
-        emit: Box<dyn Fn(&str, bool) + Send + Sync>,
-        focus_on: Box<dyn Fn(u64) + Send + Sync>,
+        emit: Box<dyn Fn(&str, Option<u64>) + Send + Sync>,
     ) -> Self {
         Self {
             emit,
-            focus_on,
+            focused: Mutex::new(None),
             inputs: Mutex::new(VecDeque::new()),
             permit: Mutex::new(None),
             asking: AtomicU64::new(0),
@@ -156,6 +167,10 @@ impl Drop for Server {
     }
 }
 
+// A client that stops reading is dropped after this, so it cannot stall the agent loop.
+#[cfg(unix)]
+const CLIENT_WRITE_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub fn serve(home: &Path, session: &Session, repo: &Path) -> Result<Server> {
     let socket = endpoint(home, &session.id);
     #[cfg(unix)]
@@ -183,20 +198,13 @@ pub fn serve(home: &Path, session: &Session, repo: &Path) -> Result<Server> {
         let repo = repo.to_path_buf();
         let clients: Arc<Mutex<Vec<(u64, std::os::unix::net::UnixStream)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let focused: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let ids = Arc::new(AtomicU64::new(1));
         let hub = Hub {
             emit: {
                 let clients = Arc::clone(&clients);
-                let focused = Arc::clone(&focused);
-                Box::new(move |line, only| emit_unix(&clients, &focused, line, only))
+                Box::new(move |line, target| emit_unix(&clients, line, target))
             },
-            focus_on: {
-                let focused = Arc::clone(&focused);
-                Box::new(move |id| {
-                    *focused.lock().expect("clients") = Some(id);
-                })
-            },
+            focused: Mutex::new(None),
             inputs: Mutex::new(VecDeque::new()),
             permit: Mutex::new(None),
             asking: AtomicU64::new(0),
@@ -216,14 +224,18 @@ pub fn serve(home: &Path, session: &Session, repo: &Path) -> Result<Server> {
                 let Ok(writer) = stream.try_clone() else {
                     continue;
                 };
+                let _ = writer.set_write_timeout(Some(CLIENT_WRITE_LIMIT));
                 let id = ids.fetch_add(1, Ordering::Relaxed);
                 clients.lock().expect("clients").push((id, writer));
                 let hub = Arc::clone(&live);
                 let session_dir = session_dir.clone();
                 let session_id = session_id.clone();
                 let repo = repo.clone();
+                let clients = Arc::clone(&clients);
                 thread::spawn(move || {
                     let _ = reader(stream, &hub, id, &session_dir, &session_id, &repo);
+                    clients.lock().expect("clients").retain(|(c, _)| *c != id);
+                    hub.forget(id);
                 });
             }
         });
@@ -271,23 +283,23 @@ fn unix_len(path: &Path) -> usize {
 #[cfg(unix)]
 fn emit_unix(
     clients: &Mutex<Vec<(u64, std::os::unix::net::UnixStream)>>,
-    focused: &Mutex<Option<u64>>,
     line: &str,
-    only_focused: bool,
+    target: Option<u64>,
 ) {
-    let target = focused.lock().expect("clients").clone();
     let streams = {
         let guard = clients.lock().expect("clients");
         guard
             .iter()
-            .filter(|(id, _)| !only_focused || target == Some(*id))
-            .filter_map(|(_, stream)| stream.try_clone().ok())
+            .filter(|(id, _)| target.is_none_or(|target| target == *id))
+            .filter_map(|(id, stream)| stream.try_clone().ok().map(|stream| (*id, stream)))
             .collect::<Vec<_>>()
     };
     let payload = format!("{line}\n");
-    for mut stream in streams {
-        let _ = stream.write_all(payload.as_bytes());
-        let _ = stream.flush();
+    for (id, mut stream) in streams {
+        if stream.write_all(payload.as_bytes()).is_err() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            clients.lock().expect("clients").retain(|(c, _)| *c != id);
+        }
     }
 }
 
@@ -313,7 +325,7 @@ fn reader(
             hub.focus(id);
             let response = dispatch_rpc(&request, session_dir, session_id, repo);
             deliver(hub, &request);
-            hub.raw(&response);
+            hub.reply(id, &response);
         }
         line.clear();
     }
@@ -353,10 +365,6 @@ fn dispatch_rpc(request: &Value, session_dir: &Path, session_id: &str, repo: &Pa
         "session/input" => {
             let text = params.get("text").and_then(Value::as_str).unwrap_or("");
             append_line(session_dir, &json!({"kind": "user", "text": text}));
-            broadcast_note(
-                session_dir,
-                &json!({"jsonrpc": "2.0", "method": "session/stream", "params": {"text": text}}),
-            );
             json!({"ok": true})
         }
         "session/selection" => {
@@ -369,11 +377,6 @@ fn dispatch_rpc(request: &Value, session_dir: &Path, session_id: &str, repo: &Pa
         }
         "session/diff" => json!({"diff": git_diff(repo)}),
         "session/status" => json!({"session_id": session_id}),
-        "session/tool" => {
-            let note = json!({"jsonrpc": "2.0", "method": "session/tool", "params": params});
-            broadcast_note(session_dir, &note);
-            json!({"ok": true})
-        }
         _ => json!({"error": "unknown method"}),
     };
     if let Some(object) = result.as_object_mut() {
@@ -387,17 +390,6 @@ fn dispatch_rpc(request: &Value, session_dir: &Path, session_id: &str, repo: &Pa
         result
     };
     response.to_string()
-}
-
-fn broadcast_note(session_dir: &Path, note: &Value) {
-    let path = session_dir.join("uhp-notes.jsonl");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{note}");
-    }
 }
 
 impl Server {
@@ -534,22 +526,11 @@ mod windows_pipe {
         let repo = repo.to_path_buf();
         let name = socket.clone();
         let clients: Arc<Mutex<Vec<(u64, PipeHandle)>>> = Arc::new(Mutex::new(Vec::new()));
-        let focused: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let ids = Arc::new(AtomicU64::new(1));
-        let hub = super::Hub::new(
-            session_id.clone(),
-            {
-                let clients = Arc::clone(&clients);
-                let focused = Arc::clone(&focused);
-                Box::new(move |line, only| emit_pipe(&clients, &focused, line, only))
-            },
-            {
-                let focused = Arc::clone(&focused);
-                Box::new(move |id| {
-                    *focused.lock().expect("clients") = Some(id);
-                })
-            },
-        )
+        let hub = super::Hub::new(session_id.clone(), {
+            let clients = Arc::clone(&clients);
+            Box::new(move |line, target| emit_pipe(&clients, line, target))
+        })
         .install();
         let live = Arc::clone(&hub);
         let thread = thread::spawn(move || {
@@ -580,10 +561,17 @@ mod windows_pipe {
                 let session_id = session_id.clone();
                 let repo = repo.clone();
                 let pipe = PipeHandle(pipe);
+                let clients = Arc::clone(&clients);
                 thread::spawn(move || {
                     // Edition 2021 would otherwise capture only the raw pointer, which is not Send.
                     let pipe = pipe;
                     read_pipe(pipe.0, &hub, id, &session_dir, &session_id, &repo);
+                    hub.forget(id);
+                    let mut guard = clients.lock().expect("clients");
+                    if let Some(index) = guard.iter().position(|(c, _)| *c == id) {
+                        close_pipe(guard.remove(index).1 .0);
+                    }
+                    drop(guard);
                     let _ = unsafe { DisconnectNamedPipe(pipe.0) };
                     close_pipe(pipe.0);
                 });
@@ -674,20 +662,14 @@ mod windows_pipe {
         ) -> Bool;
     }
 
-    fn emit_pipe(
-        clients: &Mutex<Vec<(u64, PipeHandle)>>,
-        focused: &Mutex<Option<u64>>,
-        line: &str,
-        only_focused: bool,
-    ) {
-        let target = *focused.lock().expect("clients");
+    // shortcut: a client that stops reading can still stall this write; upgrade to overlapped pipes.
+    fn emit_pipe(clients: &Mutex<Vec<(u64, PipeHandle)>>, line: &str, target: Option<u64>) {
         let payload = format!("{line}\n");
         let guard = clients.lock().expect("clients");
         for (id, handle) in guard.iter() {
-            if only_focused && target != Some(*id) {
-                continue;
+            if target.is_none_or(|target| target == *id) {
+                let _ = write_handle(handle.0, payload.as_bytes());
             }
-            let _ = write_handle(handle.0, payload.as_bytes());
         }
     }
 
@@ -744,7 +726,7 @@ mod windows_pipe {
                     hub.focus(id);
                     let response = dispatch_rpc(&request, session_dir, session_id, repo);
                     super::deliver(hub, &request);
-                    hub.raw(&response);
+                    hub.reply(id, &response);
                 }
             }
         }

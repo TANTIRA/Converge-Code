@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::home;
 use crate::provider;
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_CAPTURE: usize = 1024 * 1024;
 // A background child can hold the pipes open for as long as it lives, so wait only briefly.
 const PIPE_GRACE: Duration = Duration::from_millis(500);
@@ -32,6 +32,7 @@ pub fn run_timeout(cwd: &Path, command: &str, timeout: Duration) -> Result<Comma
     let (program, prefix) = shell_invocation();
     let mut process = Command::new(&program);
     prepare(&mut process, cwd);
+    remove_provider_keys(&mut process);
     process.args(&prefix).arg(command);
     finish(&program, process, timeout)
 }
@@ -56,13 +57,17 @@ fn prepare(process: &mut Command, cwd: &Path) {
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove("CONVERGE_API_KEY");
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         process.process_group(0);
     }
+}
+
+// Only the model's shell loses the keys. A backend CLI is the user's and needs its own.
+fn remove_provider_keys(process: &mut Command) {
+    process.env_remove("CONVERGE_API_KEY");
     if let Ok(home) = home::converge_home() {
         for name in provider::secret_envs(&home) {
             process.env_remove(name);

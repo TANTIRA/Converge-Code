@@ -616,11 +616,7 @@ fn two_clients_share_one_named_pipe() {
     )
     .unwrap();
     second.flush().unwrap();
-    // Replies go to every client, so the reply to the first client's input comes first.
-    let attached = (0..5)
-        .map(|_| read_pipe_line(&mut second))
-        .find(|line| line.contains("transcript"))
-        .expect("attach reply");
+    let attached = read_pipe_line(&mut second);
     assert!(attached.contains("hello from a"));
     drop(server);
 }

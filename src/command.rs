@@ -5,26 +5,13 @@ use crate::error::{Error, Result};
 use crate::git;
 use crate::home;
 use crate::mmdp;
-use crate::session::{self, Budget};
+use crate::session;
 use crate::windows_isolation;
 use crate::workflow;
 
 fn open_session(cwd: &Path) -> Result<session::Session> {
     let workspace = git::identify(cwd)?;
-    let converge_home = home::converge_home()?;
-    match session::load_unfinished(&converge_home, &workspace)? {
-        Some(session) => Ok(session),
-        None => session::create(
-            &converge_home,
-            &workspace,
-            None,
-            Budget {
-                steps: None,
-                tokens: None,
-                seconds: None,
-            },
-        ),
-    }
+    session::open(&home::converge_home()?, &workspace)
 }
 
 pub fn set_work_mode_cli(cwd: &Path, mode: &str) -> Result<i32> {

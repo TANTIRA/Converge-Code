@@ -4,6 +4,12 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
+const MAX_RETRY_WAIT: u64 = 6;
+
+fn retryable(status: u16) -> bool {
+    status == 429 || status >= 500
+}
+
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
@@ -22,10 +28,6 @@ pub struct ModelTurn {
     pub total_tokens: u64,
 }
 
-pub trait Model {
-    fn complete(&mut self, messages: &[Value], tools: &[ToolSpec]) -> Result<ModelTurn>;
-}
-
 pub struct OpenAiCompatible {
     endpoint: String,
     api_key: String,
@@ -37,8 +39,10 @@ impl OpenAiCompatible {
     pub fn open(home: &std::path::Path) -> Result<Self> {
         let resolved = crate::provider::resolve(home)?;
         let endpoint = chat_endpoint(&resolved.profile.base_url);
+        // Replies are not streamed, so a long answer arrives as one slow read.
         let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(120))
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_read(Duration::from_secs(600))
             .build();
         Ok(Self {
             endpoint,
@@ -47,32 +51,38 @@ impl OpenAiCompatible {
             agent,
         })
     }
-}
 
-impl Model for OpenAiCompatible {
-    fn complete(&mut self, messages: &[Value], tools: &[ToolSpec]) -> Result<ModelTurn> {
+    pub fn complete(&mut self, messages: &[Value], tools: &[ToolSpec]) -> Result<ModelTurn> {
         let body = json!({
             "model": self.model,
             "messages": messages,
             "tools": tool_payload(tools),
         });
-        let response = self
-            .agent
-            .post(&self.endpoint)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
-            .send_json(body)
-            .map_err(|error| match error {
-                ureq::Error::Status(code, response) => {
+        let mut waited = 0;
+        let response = loop {
+            let attempt = self
+                .agent
+                .post(&self.endpoint)
+                .set("Authorization", &format!("Bearer {}", self.api_key))
+                .send_json(&body);
+            match attempt {
+                Ok(response) => break response,
+                Err(ureq::Error::Status(code, _)) if retryable(code) && waited < MAX_RETRY_WAIT => {
+                    waited = waited * 2 + 2;
+                    std::thread::sleep(Duration::from_secs(waited));
+                }
+                Err(ureq::Error::Status(code, response)) => {
                     let body = response.into_string().unwrap_or_default();
-                    Error::new(format!(
+                    return Err(Error::new(format!(
                         "model request failed: status {code}: {}",
                         clip_error_body(&body)
-                    ))
+                    )));
                 }
-                ureq::Error::Transport(transport) => {
-                    Error::new(format!("model request failed: {transport}"))
+                Err(ureq::Error::Transport(transport)) => {
+                    return Err(Error::new(format!("model request failed: {transport}")));
                 }
-            })?;
+            }
+        };
         let parsed: Value = response
             .into_json()
             .map_err(|error| Error::new(format!("model response was not json: {error}")))?;
