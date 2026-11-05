@@ -11,6 +11,7 @@ jobs:
   ci:
     name: ci (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +37,7 @@ jobs:
           fi
           rustup component add rustfmt
           cargo fmt --check
-          cargo test
+          cargo test --no-fail-fast
 
   live:
     name: live

@@ -493,6 +493,14 @@ mod windows_pipe {
             written: *mut Dword,
             overlapped: *mut u8,
         ) -> Bool;
+        fn PeekNamedPipe(
+            pipe: Handle,
+            buffer: *mut u8,
+            size: Dword,
+            read: *mut Dword,
+            available: *mut Dword,
+            left: *mut Dword,
+        ) -> Bool;
         fn CloseHandle(handle: Handle) -> Bool;
         fn GetLastError() -> Dword;
         fn DisconnectNamedPipe(pipe: Handle) -> Bool;
@@ -694,6 +702,26 @@ mod windows_pipe {
         let mut pending = Vec::new();
         let mut buffer = [0u8; 1024];
         loop {
+            // A ReadFile that waits here would also hold up every WriteFile to this client,
+            // because synchronous I/O on one pipe runs one call at a time.
+            let mut available = 0;
+            let open = unsafe {
+                PeekNamedPipe(
+                    pipe,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    &mut available,
+                    ptr::null_mut(),
+                )
+            };
+            if open == 0 {
+                break;
+            }
+            if available == 0 {
+                thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
             let mut read = 0;
             let ok = unsafe {
                 ReadFile(
