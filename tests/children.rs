@@ -194,3 +194,156 @@ fn a_finished_step_does_not_run_again_on_resume() {
     );
     assert!(!fixture.worktree(&dir, "once").exists());
 }
+
+fn head(fixture: &Fixture) -> Vec<u8> {
+    fixture.git(&["rev-parse", "HEAD"]).stdout
+}
+
+fn workflow_with_one_child(fixture: &Fixture) -> PathBuf {
+    let dir = fixture.write_workflow(r#"[{"op":"agent","id":"alpha","goal":"add the file"}]"#);
+    let run = fixture.converge(&["workflow", "--test", "test -f file.txt"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    dir
+}
+
+fn status_of_alpha(dir: &Path) -> serde_json::Value {
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("workflow.json")).unwrap()).unwrap();
+    document["steps"][0]["status"].clone()
+}
+
+#[test]
+fn merge_brings_a_passing_child_into_the_parent_and_cleans_up() {
+    let fixture = Fixture::new("merge");
+    let dir = workflow_with_one_child(&fixture);
+    assert!(!fixture.repo.join("child.txt").exists());
+
+    let merge = fixture.converge(&["merge", "alpha", "--test", "test -f child.txt"]);
+    assert!(
+        merge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+
+    assert!(fixture.repo.join("child.txt").exists());
+    assert!(fixture.git(&["status", "--porcelain"]).stdout.is_empty());
+    let log =
+        String::from_utf8_lossy(&fixture.git(&["log", "-2", "--format=%s"]).stdout).into_owned();
+    assert!(log.contains("Merge alpha: add the file"), "{log}");
+    assert!(!fixture.worktree(&dir, "alpha").exists());
+    let branches = fixture.git(&["branch", "--list", "converge/*"]).stdout;
+    assert!(
+        branches.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&branches)
+    );
+    assert_eq!(status_of_alpha(&dir), "merged");
+}
+
+#[test]
+fn a_failing_test_on_the_merged_tree_undoes_the_merge() {
+    let fixture = Fixture::new("undo");
+    let dir = workflow_with_one_child(&fixture);
+    let before = head(&fixture);
+
+    let merge = fixture.converge(&["merge", "alpha", "--test", "test -f absent.txt"]);
+    assert!(!merge.status.success());
+    assert!(String::from_utf8_lossy(&merge.stderr).contains("merge undone"));
+
+    assert_eq!(head(&fixture), before);
+    assert!(!fixture.repo.join("child.txt").exists());
+    assert!(fixture.git(&["status", "--porcelain"]).stdout.is_empty());
+    assert!(!fixture
+        .git(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .status
+        .success());
+    assert!(fixture.worktree(&dir, "alpha").exists());
+    assert_eq!(status_of_alpha(&dir), "done");
+
+    let retry = fixture.converge(&["merge", "alpha", "--test", "test -f child.txt"]);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(fixture.repo.join("child.txt").exists());
+}
+
+#[test]
+fn a_conflict_undoes_the_merge_and_keeps_the_parent_clean() {
+    let fixture = Fixture::new("conflict");
+    let dir = workflow_with_one_child(&fixture);
+    fs::write(fixture.repo.join("child.txt"), "the parent wrote this").unwrap();
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "-qm", "parent change"]);
+    let before = head(&fixture);
+
+    let merge = fixture.converge(&["merge", "alpha", "--test", "test -f file.txt"]);
+    assert!(!merge.status.success());
+
+    assert_eq!(head(&fixture), before);
+    assert!(fixture.git(&["status", "--porcelain"]).stdout.is_empty());
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("child.txt")).unwrap(),
+        "the parent wrote this"
+    );
+    assert_eq!(status_of_alpha(&dir), "done");
+}
+
+#[test]
+fn merge_refuses_a_dirty_parent_a_failed_child_and_a_bad_id() {
+    let fixture = Fixture::new("refuse");
+    let dir = workflow_with_one_child(&fixture);
+    fs::write(fixture.repo.join("file.txt"), "my unsaved work").unwrap();
+    let dirty = fixture.converge(&["merge", "alpha", "--test", "test -f file.txt"]);
+    assert!(!dirty.status.success());
+    assert!(String::from_utf8_lossy(&dirty.stderr).contains("uncommitted"));
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).unwrap(),
+        "my unsaved work"
+    );
+    fixture.git(&["checkout", "--", "file.txt"]);
+    assert!(!fixture
+        .converge(&["merge", "../alpha", "--test", "true"])
+        .status
+        .success());
+    assert!(!fixture
+        .converge(&["merge", "nobody", "--test", "true"])
+        .status
+        .success());
+
+    let document = fs::read_to_string(dir.join("workflow.json")).unwrap();
+    fs::write(
+        dir.join("workflow.json"),
+        document.replace("\"done\"", "\"failed\""),
+    )
+    .unwrap();
+    let failed = fixture.converge(&["merge", "alpha", "--test", "test -f file.txt"]);
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("is failed"));
+    assert!(!fixture.repo.join("child.txt").exists());
+}
+
+#[test]
+fn the_commit_hook_can_block_a_merge() {
+    let fixture = Fixture::new("hook");
+    let dir = workflow_with_one_child(&fixture);
+    assert!(fixture.converge(&["hook", "install"]).status.success());
+    let lint = fixture.repo.join("lint");
+    fs::write(&lint, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lint, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let before = head(&fixture);
+    let merge = fixture.converge(&["merge", "alpha", "--test", "test -f file.txt"]);
+    assert!(!merge.status.success());
+    assert_eq!(head(&fixture), before);
+    assert!(!fixture.repo.join("child.txt").exists());
+    assert_eq!(status_of_alpha(&dir), "done");
+}

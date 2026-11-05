@@ -58,6 +58,16 @@ pub fn run_workflow_cli(cwd: &Path, test_command: &str) -> Result<i32> {
     Ok(output.status)
 }
 
+pub fn merge_child_cli(cwd: &Path, id: &str, test_command: &str) -> Result<i32> {
+    let workspace = git::identify(cwd)?;
+    let home = home::converge_home()?;
+    println!(
+        "{}",
+        workflow::merge_child(&home, &workspace, id, test_command)?
+    );
+    Ok(0)
+}
+
 pub fn show_backend_cli() -> Result<i32> {
     let home = home::converge_home()?;
     let name = crate::backend::selected(&home)?;

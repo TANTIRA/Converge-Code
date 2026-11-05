@@ -179,6 +179,20 @@ fn task_reply(session: &Session, rest: &str) -> String {
     }
 }
 
+fn merge_reply(session: &Session, rest: &str) -> String {
+    let Some((id, test)) = rest.split_once(" --test ") else {
+        return "usage: /merge <id> --test <command>".to_string();
+    };
+    let merged = home::converge_home().and_then(|home| {
+        let workspace = git::identify(&session.workspace)?;
+        crate::workflow::merge_child(&home, &workspace, id.trim(), test.trim())
+    });
+    match merged {
+        Ok(text) => text,
+        Err(error) => error.message,
+    }
+}
+
 fn plan_reply(session: &mut Session, action: &str) -> Result<String> {
     match action {
         "approve" => modes::approve_plan(session)?,
@@ -403,6 +417,9 @@ fn command_line(session: &mut Session, line: &str) -> Result<Option<String>> {
     }
     if line == "/tasks" {
         return Ok(Some(tasks_reply(session)));
+    }
+    if let Some(rest) = line.strip_prefix("/merge ") {
+        return Ok(Some(merge_reply(session, rest)));
     }
     if let Some(rest) = line.strip_prefix("/task ") {
         return Ok(Some(task_reply(session, rest)));

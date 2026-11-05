@@ -17,6 +17,7 @@ pub enum Invocation {
     ModePermission(String),
     Tasks,
     Workflow(String),
+    Merge(String, String),
     Schedule(Args),
     Trigger(Args),
     MmdpPut(String),
@@ -49,6 +50,12 @@ impl Invocation {
                 )),
             },
             "tasks" => Ok(Self::Tasks),
+            "merge" => match (args.get(1), args.get(2).map(String::as_str), args.get(3)) {
+                (Some(id), Some("--test"), Some(test)) if !test.is_empty() => {
+                    Ok(Self::Merge(id.clone(), test.clone()))
+                }
+                _ => Err(Error::new("usage: converge merge <id> --test <command>")),
+            },
             "workflow" => match (args.get(1).map(String::as_str), args.get(2)) {
                 (Some("--test"), Some(test)) if !test.is_empty() => {
                     Ok(Self::Workflow(test.clone()))

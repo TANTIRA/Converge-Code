@@ -48,6 +48,8 @@ A script that was interrupted resumes from `workflow.json` in the session direct
 
 `converge workflow --test <command>` runs the script. Each `agent` step starts a child session, `converge -p <goal> --test <command>`, in a worktree under `<git common dir>/converge-worktrees/<session_id>/`. A step is `done` only when its child exits with code 0, and otherwise `failed`. A failed `pipeline` step stops the steps after it. After every child passes, the command also runs in the parent.
 
+`converge merge <id> --test <command>`, or `/merge <id> --test <command>` in chat, is the merge. It commits the child's work in its worktree, merges that branch into the parent's current branch without committing, and runs the command on the merged tree. The merge commit then goes through the commit hook. A conflict, a failing command, or a failing lint undoes the merge and keeps the child's branch. A merge needs a `done` child and no uncommitted changes to tracked files in the parent. After a merge, the worktree and branch are removed and the child's status is `merged`.
+
 In a terminal chat, `/task <goal> --test <command>` starts a background task in `multi-task` or `dynamic-workflow`.
 
 ## Single-agent

@@ -143,6 +143,18 @@ pub fn load_unfinished(home: &Path, workspace: &Workspace) -> Result<Option<Sess
     Ok(newest.map(|(_, session)| session))
 }
 
+pub(crate) fn load_by_id(home: &Path, workspace: &Workspace, id: &str) -> Result<Session> {
+    let dir = home
+        .join("projects")
+        .join(&workspace.repo_key)
+        .join("sessions")
+        .join(id);
+    let mut session =
+        read_session(&dir)?.ok_or_else(|| Error::new(format!("no session named {id}")))?;
+    session.workspace = workspace.toplevel.clone();
+    Ok(session)
+}
+
 pub fn set_goal(session: &mut Session, goal: String) -> Result<()> {
     session.goal = Some(goal);
     write_record(session)
