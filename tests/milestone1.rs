@@ -141,7 +141,11 @@ fn session_record_stays_outside_the_repo() {
     assert!(record.contains("single-agent"));
     assert!(record.contains("dontAsk"));
     assert!(record.contains("keep the tests green"));
-    assert!(record.contains(&workspace.toplevel.display().to_string()));
+    let stored: serde_json::Value = serde_json::from_str(&record).expect("json");
+    assert_eq!(
+        stored["workspace"].as_str(),
+        Some(workspace.toplevel.to_string_lossy().as_ref())
+    );
     assert!(!repo.path().join("session.json").exists());
     assert!(!contains_lesson(home.path()));
 }
