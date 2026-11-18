@@ -187,8 +187,12 @@ fn plan_and_workflow_tools_reach_the_session_store() {
         serde_json::from_slice(&fs::read(workflow).expect("read")).expect("json");
     assert_eq!(stored["version"], 1);
     assert_eq!(stored["steps"][0]["op"], "agent");
-    // Storing is not running: the child worktree does not exist yet.
-    assert!(!user_home.path().join(".converge").join("run").exists());
+    // Storing is not running: no child worktree was created for the step.
+    let worktrees = repo.path().join(".git").join("converge-worktrees");
+    assert!(
+        walk(&worktrees, "alpha").is_none(),
+        "storing the workflow started a child"
+    );
     assert_eq!(session_json(user_home.path())["work_mode"], "plan");
     let approve = converge(repo.path(), user_home.path(), &["plan", "approve"]);
     assert!(approve.status.success(), "{:?}", approve);
