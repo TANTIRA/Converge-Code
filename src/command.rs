@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,25 @@ pub fn set_permission_mode_cli(cwd: &Path, mode: &str) -> Result<i32> {
     Ok(0)
 }
 
+pub fn plan_cli(cwd: &Path, action: &str) -> Result<i32> {
+    let mut session = open_session(cwd)?;
+    match action {
+        "approve" => crate::modes::approve_plan(&mut session)?,
+        "reject" => crate::modes::reject_plan(&mut session)?,
+        "show" => {
+            let path = session.dir.join("plan.md");
+            if path.is_file() {
+                println!("{}", fs::read_to_string(&path).unwrap_or_default());
+                return Ok(0);
+            }
+            return Err(Error::new("this session has no plan"));
+        }
+        _ => return Err(Error::new("plan action is approve, reject, or show")),
+    }
+    println!("{}", session.work_mode);
+    Ok(0)
+}
+
 pub fn print_tasks(cwd: &Path) -> Result<i32> {
     let session = open_session(cwd)?;
     let text = workflow::tasks_text(&session.dir)?;
@@ -58,6 +78,14 @@ pub fn run_workflow_cli(cwd: &Path, test_command: &str) -> Result<i32> {
             "stderr": output.stderr,
         }),
     )?;
+    let mut session = session;
+    session.last_test_status = Some(output.status);
+    session::save(&session)?;
+    if output.status == 0 {
+        crate::memory::flush_lessons(&session)?;
+    } else {
+        crate::memory::discard_lessons(&session);
+    }
     Ok(output.status)
 }
 

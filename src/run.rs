@@ -53,11 +53,14 @@ fn print_session(cwd: &Path, args: &Args) -> Result<i32> {
     if let Some(warning) = crate::sandbox::missing_warning() {
         eprintln!("{warning}");
     }
+    // Loaded once, at the start of the session. A turn does not reload it.
+    let memory = crate::memory::load_index(&home, &workspace.repo_key)?;
     let mut messages = vec![
         json!({
             "role": "system",
             "content": system_prompt(
                 &instructions,
+                &memory,
                 &args.test_command,
                 session.goal.as_deref(),
             ),
@@ -86,6 +89,7 @@ fn print_session(cwd: &Path, args: &Args) -> Result<i32> {
         &home,
         &mut messages,
         &args.test_command,
+        &instructions,
     )
 }
 
@@ -95,8 +99,10 @@ fn execute(
     home: &Path,
     messages: &mut Vec<Value>,
     test_command: &str,
+    instructions: &str,
 ) -> Result<i32> {
-    let mut tools = model::admitted_tools();
+    let mut tools = model::admitted_tools(&session.work_mode);
+    let offered: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
     let mut mcp_names = Vec::new();
     if let Some(server) = session.mcp_server.clone() {
         let ask = session.work_mode == "ask";
@@ -113,6 +119,7 @@ fn execute(
         if exhausted(&session.budget, steps, tokens, seconds) {
             return out_of_budget(session);
         }
+        compact(messages, session, instructions);
         let turn = model.complete(messages, &tools)?;
         steps += 1;
         tokens = tokens.saturating_add(turn.total_tokens);
@@ -151,12 +158,19 @@ fn execute(
                         }),
                     )?;
                     if stop_allowed(output.status) {
+                        session.last_test_status = Some(output.status);
                         if session.work_mode == "debug" {
                             session.source_closed = true;
-                            session::save(session)?;
+                        }
+                        session::save(session)?;
+                        if let Err(error) = crate::memory::flush_lessons(session) {
+                            eprintln!("lesson not written: {}", error.message);
                         }
                         return Ok(0);
                     }
+                    session.last_test_status = Some(output.status);
+                    crate::memory::discard_lessons(session);
+                    session::save(session)?;
                     format!(
                         "Completion command exited with status {}.\nstdout:\n{}\nstderr:\n{}",
                         output.status,
@@ -177,7 +191,8 @@ fn execute(
             continue;
         }
         if let Some(denied) = turn.tool_calls.iter().find(|call| {
-            !model::is_admitted(&call.name) && !mcp_names.iter().any(|name| name == &call.name)
+            !offered.iter().any(|name| name == &call.name)
+                && !mcp_names.iter().any(|name| name == &call.name)
         }) {
             session::append(session, &json!({"kind": "denied", "name": denied.name}))?;
             return Ok(1);
@@ -253,8 +268,38 @@ pub(crate) fn dispatch(session: &Session, name: &str, arguments: &str, tty: bool
                 Err(error) => error.message,
             }
         }
-        // No MCP client exists yet, so say that nothing ran rather than report a success.
-        _ => format!("error: {name} is not connected, and nothing was run"),
+        "plan" => {
+            let text = parsed.get("text").and_then(Value::as_str).unwrap_or("");
+            match modes::write_plan(session, text) {
+                Ok(()) => format!("plan stored at {}", session.dir.join("plan.md").display()),
+                Err(error) => error.message,
+            }
+        }
+        "workflow" => {
+            let script = parsed.get("script").and_then(Value::as_str).unwrap_or("");
+            match crate::workflow::store(session, script) {
+                Ok(text) => text,
+                Err(error) => error.message,
+            }
+        }
+        "lesson" => {
+            let field = |name: &str| parsed.get(name).and_then(Value::as_str).unwrap_or("");
+            match crate::memory::write_session_lesson(
+                session,
+                field("name"),
+                field("symptom"),
+                field("rule"),
+                field("test"),
+            ) {
+                Ok(text) => text,
+                Err(error) => error.message,
+            }
+        }
+        // Anything else in the offered list is a tool of the MCP server this task uses.
+        _ => match crate::mcp::call(name, arguments) {
+            Ok(text) => text,
+            Err(error) => error.message,
+        },
     }
 }
 
@@ -283,7 +328,12 @@ pub(crate) fn exit_on_interrupt() {
     });
 }
 
-fn system_prompt(instructions: &str, test_command: &str, goal: Option<&str>) -> String {
+fn system_prompt(
+    instructions: &str,
+    memory: &str,
+    test_command: &str,
+    goal: Option<&str>,
+) -> String {
     let mut prompt = String::from(
         "You are Converge. Edit files with the edit tool and run commands with the shell tool. The task is complete only when the completion command exits with code 0.\n",
     );
@@ -298,7 +348,46 @@ fn system_prompt(instructions: &str, test_command: &str, goal: Option<&str>) -> 
         prompt.push_str("\n\nProject instructions:\n");
         prompt.push_str(instructions);
     }
+    if !memory.is_empty() {
+        prompt.push_str("\n\nAgent memory index for this repo:\n");
+        prompt.push_str(memory);
+    }
     prompt
+}
+
+const COMPACT_AFTER: usize = 40;
+const KEEP_RECENT: usize = 12;
+
+// Drops old turns from the model window. The goal, the last test result, and the
+// instructions that were loaded at the start of the session survive.
+pub fn compact(messages: &mut Vec<Value>, session: &Session, instructions: &str) {
+    if messages.len() <= COMPACT_AFTER {
+        return;
+    }
+    let mut cut = messages.len() - KEEP_RECENT;
+    // A kept slice starts on a user turn, so a tool result never loses its call.
+    while cut > 1 && messages[cut].get("role").and_then(Value::as_str) != Some("user") {
+        cut -= 1;
+    }
+    if cut <= 1 {
+        return;
+    }
+    let mut transcript: String = messages[1..cut]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(status) = session.last_test_status {
+        transcript.push_str(&format!("\n{{\"kind\":\"test\",\"status\":{status}}}"));
+    }
+    let kept = modes::compact_window(session.goal.as_deref(), instructions, &transcript);
+    let recent: Vec<Value> = messages[cut..].to_vec();
+    messages.truncate(1);
+    messages.push(json!({
+        "role": "user",
+        "content": format!("Compacted earlier turns:\n{kept}"),
+    }));
+    messages.extend(recent);
 }
 
 fn out_of_budget(session: &Session) -> Result<i32> {

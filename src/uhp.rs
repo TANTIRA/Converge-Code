@@ -358,10 +358,11 @@ fn dispatch_rpc(request: &Value, session_dir: &Path, session_id: &str, repo: &Pa
     let id = request.get("id").cloned();
     let params = request.get("params").cloned().unwrap_or(json!({}));
     let mut result = match method {
-        "session/attach" => json!({
-            "session_id": session_id,
-            "transcript": read_transcript(session_dir),
-        }),
+        "session/attach" => {
+            let mut attached = status(session_dir, session_id);
+            attached["transcript"] = json!(read_transcript(session_dir));
+            attached
+        }
         "session/input" => {
             let text = params.get("text").and_then(Value::as_str).unwrap_or("");
             append_line(session_dir, &json!({"kind": "user", "text": text}));
@@ -376,7 +377,7 @@ fn dispatch_rpc(request: &Value, session_dir: &Path, session_id: &str, repo: &Pa
             json!({"ok": true})
         }
         "session/diff" => json!({"diff": git_diff(repo)}),
-        "session/status" => json!({"session_id": session_id}),
+        "session/status" => status(session_dir, session_id),
         _ => json!({"error": "unknown method"}),
     };
     if let Some(object) = result.as_object_mut() {
@@ -390,6 +391,24 @@ fn dispatch_rpc(request: &Value, session_dir: &Path, session_id: &str, repo: &Pa
         result
     };
     response.to_string()
+}
+
+// One payload for attach and for status, so a client reads the same fields either way.
+fn status(session_dir: &Path, session_id: &str) -> Value {
+    let stored: Value = fs::read(session_dir.join("session.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let tasks = crate::workflow::tasks(session_dir).unwrap_or_default();
+    json!({
+        "session_id": session_id,
+        "work_mode": stored.get("work_mode").cloned().unwrap_or(Value::Null),
+        "permission_mode": stored.get("permission_mode").cloned().unwrap_or(Value::Null),
+        "goal": stored.get("goal").cloned().unwrap_or(Value::Null),
+        "plan": session_dir.join("plan.md").is_file(),
+        "workflow": session_dir.join("workflow.json").is_file(),
+        "tasks": tasks,
+    })
 }
 
 impl Server {
@@ -774,5 +793,6 @@ pub fn allowed_methods() -> &'static [&'static str] {
         "permission/ask",
         "session/diff",
         "session/status",
+        "session/tasks",
     ]
 }

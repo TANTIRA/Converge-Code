@@ -20,6 +20,8 @@ A lesson is written only when the completion command exits with code 0, through 
 
 A failed run, including `converge -p` with a non-zero code, does not add a lesson. The failure trace stays in the transcript.
 
+A lesson the model records earlier in the turn is staged in the session directory. The kernel moves it into memory when that completion command exits with code 0, and drops it when the command fails. A run that stops on the budget, a denial, or a cancel keeps the staged lesson for the resume.
+
 `feedback`, `project`, and `reference` follow [07-memory.md](07-memory.md). They are not lessons and do not replace the test condition on `lesson`.
 
 ## Revert

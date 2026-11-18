@@ -71,6 +71,38 @@ pub fn execute(session: &Session, repo: &Path, bin: &Path, test_command: &str) -
     Ok(passed)
 }
 
+// Storing is not running. The kernel runs the document only after the plan is approved.
+pub fn store(session: &Session, script: &str) -> Result<String> {
+    if !matches!(
+        session.work_mode.as_str(),
+        "ask" | "plan" | "dynamic-workflow" | "multi-task"
+    ) {
+        return Err(Error::new(format!(
+            "{} mode does not store a workflow",
+            session.work_mode
+        )));
+    }
+    let document: Value = serde_json::from_str(script)
+        .map_err(|error| Error::new(format!("workflow script is not json: {error}")))?;
+    if document.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(Error::new("workflow.json schema version must be 1"));
+    }
+    let steps = document
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("workflow.json steps must be an array"))?;
+    validate(steps)?;
+    write_json(&session.dir.join("workflow.json"), &document)?;
+    Ok(format!(
+        "workflow.json stored with {} top-level step(s). It runs only after the user approves the plan.",
+        steps.len()
+    ))
+}
+
+pub fn tasks(session_dir: &Path) -> Result<Vec<Value>> {
+    read_tasks(&session_dir.join("tasks.json"))
+}
+
 pub fn tasks_text(session_dir: &Path) -> Result<String> {
     let _guard = TASKS.lock().expect("tasks");
     let mut lines = Vec::new();
@@ -114,7 +146,8 @@ pub fn start_background(
             "worktree": dest,
             "reported": false,
         }));
-        write_json(&tasks, &Value::Array(all))?;
+        write_json(&tasks, &Value::Array(all.clone()))?;
+        publish_tasks(&all);
     }
     let bin = bin.to_path_buf();
     let goal = goal.to_string();
@@ -132,7 +165,8 @@ pub fn start_background(
                 task["status"] = json!(if passed { "done" } else { "failed" });
             }
         }
-        let _ = write_json(&tasks, &Value::Array(all));
+        let _ = write_json(&tasks, &Value::Array(all.clone()));
+        publish_tasks(&all);
     }))
 }
 
@@ -156,7 +190,8 @@ pub(crate) fn take_finished(session_dir: &Path) -> Vec<String> {
         }
     }
     if !finished.is_empty() {
-        let _ = write_json(&path, &Value::Array(all));
+        let _ = write_json(&path, &Value::Array(all.clone()));
+        publish_tasks(&all);
     }
     finished
 }
@@ -507,6 +542,10 @@ fn run_child(
     let arguments = ["-p", goal, "--goal", goal, "--test", test_command].map(str::to_string);
     shell::run_child(worktree, bin, &arguments, envs, CHILD_TIMEOUT, cancellable)
         .is_ok_and(|output| output.status == 0)
+}
+
+fn publish_tasks(tasks: &[Value]) {
+    crate::uhp::publish("session/tasks", json!({ "tasks": tasks }));
 }
 
 fn read_tasks(path: &Path) -> Result<Vec<Value>> {

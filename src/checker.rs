@@ -6,6 +6,8 @@ pub fn allow(workspace: &Path, name: &str, arguments: &str) -> Result<()> {
     match name {
         "edit" => allow_edit(workspace, arguments),
         "shell" => allow_shell(workspace, arguments),
+        // These write only inside the session directory, never the workspace.
+        "plan" | "workflow" | "lesson" => Ok(()),
         _ => Err(rejected()),
     }
 }

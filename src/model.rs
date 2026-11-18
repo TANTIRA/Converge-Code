@@ -90,39 +90,109 @@ impl OpenAiCompatible {
     }
 }
 
-pub fn admitted_tools() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "edit".to_string(),
-            description: "Replace one exact occurrence of old with new in a workspace file. Use an empty old string only to create a missing file.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old": {"type": "string"},
-                    "new": {"type": "string"}
-                },
-                "required": ["path", "old", "new"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: "shell".to_string(),
-            description: "Run one command in the workspace using the operating system shell.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        },
-    ]
+// The tool list follows the work mode, so a mode does not offer a tool it will refuse.
+pub fn admitted_tools(work_mode: &str) -> Vec<ToolSpec> {
+    let reads = matches!(work_mode, "ask" | "plan");
+    let mut tools = Vec::new();
+    if !reads {
+        tools.push(edit_tool());
+    }
+    tools.push(shell_tool());
+    if work_mode == "plan" {
+        tools.push(plan_tool());
+    }
+    if matches!(
+        work_mode,
+        "ask" | "plan" | "dynamic-workflow" | "multi-task"
+    ) {
+        tools.push(workflow_tool());
+    }
+    if !reads {
+        tools.push(lesson_tool());
+    }
+    tools
 }
 
-pub fn is_admitted(name: &str) -> bool {
-    name == "edit" || name == "shell"
+fn edit_tool() -> ToolSpec {
+    ToolSpec {
+        name: "edit".to_string(),
+        description: "Replace one exact occurrence of old with new in a workspace file. Use an empty old string only to create a missing file.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old": {"type": "string"},
+                "new": {"type": "string"}
+            },
+            "required": ["path", "old", "new"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn shell_tool() -> ToolSpec {
+    ToolSpec {
+        name: "shell".to_string(),
+        description: "Run one command in the workspace using the operating system shell."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"}
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn plan_tool() -> ToolSpec {
+    ToolSpec {
+        name: "plan".to_string(),
+        description: "Store the plan in the session directory. This does not edit the repo source."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"}
+            },
+            "required": ["text"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn workflow_tool() -> ToolSpec {
+    ToolSpec {
+        name: "workflow".to_string(),
+        description: "Store workflow.json, schema version 1, in the session directory with ops agent, parallel, and pipeline. Storing runs nothing; the kernel runs it only after the user approves the plan.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "script": {"type": "string"}
+            },
+            "required": ["script"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn lesson_tool() -> ToolSpec {
+    ToolSpec {
+        name: "lesson".to_string(),
+        description: "Record one lesson for this repo. The kernel keeps it staged and turns it into agent memory only when the completion command of this session exits with code 0.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "symptom": {"type": "string"},
+                "rule": {"type": "string"},
+                "test": {"type": "string"}
+            },
+            "required": ["name", "symptom", "rule", "test"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 fn clip_error_body(body: &str) -> String {
