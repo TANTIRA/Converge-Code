@@ -1,6 +1,6 @@
 # Converge development documentation
 
-These documents are the specification for engineers building Converge. The source is the final HLD. This repo does not yet contain a product implementation.
+These documents are the specification for engineers building Converge. The source is the final HLD. The Rust binary in `src/` implements this specification in the order given in [15-build-order.md](15-build-order.md).
 
 Read them in order for the full picture. Each file stands alone for the part it locks.
 

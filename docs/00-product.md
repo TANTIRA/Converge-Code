@@ -37,6 +37,7 @@ Ordinary chat does not force a test command on every message. The process stays 
 |---|---|
 | `/goal` | Writes, shows, or clears the session goal. The user only |
 | `/tasks` | Shows background tasks |
+| `/plan approve`, `/plan reject`, or `converge plan approve` | The user leaves or keeps plan mode. The approval changes the work mode only |
 | `--test` | The completion command for a `converge -p` run or a task that uses it |
 | `Shift+Tab` | Cycles the permission modes that are in the terminal cycle |
 

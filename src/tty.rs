@@ -280,11 +280,13 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
         Some(&crate::instructions::organization_instructions()),
         Some(&crate::instructions::user_instructions(home)),
     )?;
+    // Loaded once for this process. A turn does not reload it.
+    let memory = crate::memory::load_index(home, &workspace.repo_key)?;
     let mut view = load_view(&session);
     view.extend(crate::sandbox::missing_warning().map(str::to_string));
     let mut messages = vec![serde_json::json!({
         "role": "system",
-        "content": chat_prompt(&instructions, session.goal.as_deref()),
+        "content": chat_prompt(&instructions, &memory, session.goal.as_deref()),
     })];
     extend_messages(&mut messages, &session);
     let mut input = String::new();
@@ -320,6 +322,7 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
                 &mut view,
                 line,
                 true,
+                &instructions,
             )? {
                 return Ok(code);
             }
@@ -363,6 +366,7 @@ fn run_screen(workspace: &crate::git::Workspace, home: &Path, mut session: Sessi
                     &mut view,
                     line,
                     false,
+                    &instructions,
                 )? {
                     return Ok(code);
                 }
@@ -400,6 +404,7 @@ fn submit_line(
     view: &mut Vec<String>,
     line: String,
     recorded: bool,
+    instructions: &str,
 ) -> Result<Option<i32>> {
     if line == "/quit" {
         return Ok(Some(0));
@@ -433,7 +438,7 @@ fn submit_line(
         crate::uhp::publish("session/stream", serde_json::json!({"text": &line}));
     }
     messages.push(serde_json::json!({"role": "user", "content": line}));
-    let reply = chat_reply(session, home, model, messages, view)?;
+    let reply = chat_reply(session, home, model, messages, view, instructions)?;
     if reply == 130 {
         let exit = CANCEL.swap(false, Ordering::SeqCst);
         crate::shell::clear_stop();
@@ -463,7 +468,7 @@ fn command_line(session: &mut Session, line: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn chat_prompt(instructions: &str, goal: Option<&str>) -> String {
+fn chat_prompt(instructions: &str, memory: &str, goal: Option<&str>) -> String {
     let mut prompt = String::from(
         "You are Converge. Edit files with the edit tool and run commands with the shell tool. A chat turn is not complete because you say so.\n",
     );
@@ -475,6 +480,10 @@ fn chat_prompt(instructions: &str, goal: Option<&str>) -> String {
     if !instructions.is_empty() {
         prompt.push_str("\nProject instructions:\n");
         prompt.push_str(instructions);
+    }
+    if !memory.is_empty() {
+        prompt.push_str("\n\nAgent memory index for this repo:\n");
+        prompt.push_str(memory);
     }
     prompt
 }
@@ -692,6 +701,7 @@ fn chat_reply(
     model: &mut Option<crate::model::OpenAiCompatible>,
     messages: &mut Vec<serde_json::Value>,
     view: &mut Vec<String>,
+    instructions: &str,
 ) -> Result<i32> {
     if crate::backend::selected(home)? != "converge" {
         let prompt = last_user_text(messages);
@@ -739,11 +749,13 @@ fn chat_reply(
             session::append(session, &serde_json::json!({"kind": "note", "text": text}))?;
             return Ok(0);
         };
+        crate::run::compact(messages, session, instructions);
         let owned = messages.clone();
+        let mode = session.work_mode.clone();
         let finished = watching(|| {
             wait_for_turn(move || {
                 let mut active = active;
-                let tools = crate::model::admitted_tools();
+                let tools = crate::model::admitted_tools(&mode);
                 let result = active.complete(&owned, &tools);
                 (active, result)
             })

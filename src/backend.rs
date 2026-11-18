@@ -90,7 +90,7 @@ pub fn run_external(
 fn finish_test(session: &mut Session, test_command: &str) -> Result<i32> {
     let output = modes::run_session_shell(session, test_command)?;
     session::append(
-        session,
+        &session,
         &json!({
             "kind": "test",
             "status": output.status,
@@ -98,6 +98,15 @@ fn finish_test(session: &mut Session, test_command: &str) -> Result<i32> {
             "stderr": output.stderr,
         }),
     )?;
+    session.last_test_status = Some(output.status);
+    session::save(&session)?;
+    if output.status == 0 {
+        if let Err(error) = crate::memory::flush_lessons(&session) {
+            eprintln!("lesson not written: {}", error.message);
+        }
+    } else {
+        crate::memory::discard_lessons(&session);
+    }
     Ok(output.status)
 }
 

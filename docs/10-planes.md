@@ -39,6 +39,14 @@ MCP is external tools.
 - Other servers may exist in configuration without entering the initial context.
 - Bash, compaction, and scratch stay inside the session, outside the MCP tool list.
 
+Configuration is `~/.converge/mcp.json`. Each entry names a stdio server:
+
+```json
+{ "servers": [{ "name": "alpha", "command": "node", "args": ["server.js"], "env": {} }] }
+```
+
+The binary speaks JSON-RPC 2.0 on that process. It performs `initialize`, `notifications/initialized`, and `tools/list` for the one server a task uses, and `tools/call` for each call. A tool's `annotations.readOnlyHint` decides whether `ask` mode admits it. A tool named `bash`, `shell`, `edit`, `plan`, `workflow`, `lesson`, `compaction`, or `scratch` is not admitted, so it cannot shadow a built-in.
+
 ## MMDP
 
 MMDP is data, compute, and the model catalog when the session leaves the laptop.

@@ -716,21 +716,42 @@ fn modes_goal_plan_and_instructions() {
 
 #[test]
 fn one_mcp_server_enters_the_initial_context() {
+    // The script needs a POSIX shell. Git provides one on every OS this repo targets.
+    if Command::new("sh").args(["-c", "exit 0"]).status().is_err() {
+        eprintln!("no sh on this machine, so the mcp server test did not run");
+        return;
+    }
     let home = TempDir::new("converge-home");
+    let server = home.path().join("server.sh");
     fs::write(
-        home.path().join("mcp.json"),
-        r#"{
-            "servers": [
-                {"name": "alpha", "tools": [{"name": "alpha.lookup", "description": "find", "read_only": true}, {"name": "bash", "description": "no", "read_only": true}]},
-                {"name": "beta", "tools": [{"name": "beta.write", "description": "write", "read_only": false}]}
-            ]
-        }"#,
+        &server,
+        r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *notifications/initialized*) ;;
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05"}}\n' "$id" ;;
+    *'"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":ID,"result":{"tools":[{"name":"alpha.lookup","description":"find","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"alpha.write","description":"write","inputSchema":{"type":"object"}},{"name":"bash","description":"internal","inputSchema":{"type":"object"}}]}}' | sed "s/ID/$id/" ;;
+    *'"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"tool ran"}]}}\n' "$id" ;;
+  esac
+done
+"#,
     )
     .unwrap();
+    let config = serde_json::json!({
+        "servers": [{"name": "alpha", "command": "sh", "args": [server.to_string_lossy()]}],
+    });
+    fs::write(home.path().join("mcp.json"), config.to_string()).unwrap();
     let names = converge::context_tool_names(home.path(), "alpha", false).unwrap();
-    assert_eq!(names, vec!["alpha.lookup".to_string()]);
-    let ask = converge::context_tool_names(home.path(), "beta", true).unwrap();
-    assert!(ask.is_empty());
+    assert_eq!(
+        names,
+        vec!["alpha.lookup".to_string(), "alpha.write".to_string()]
+    );
+    let ask = converge::context_tool_names(home.path(), "alpha", true).unwrap();
+    assert_eq!(ask, vec!["alpha.lookup".to_string()]);
+    assert_eq!(
+        converge::mcp_call("alpha.lookup", "{}").unwrap(),
+        "tool ran"
+    );
 }
 
 #[test]
@@ -1013,7 +1034,7 @@ fn unknown_mcp_server_is_an_error() {
     fs::create_dir_all(&converge_home).unwrap();
     fs::write(
         converge_home.join("mcp.json"),
-        r#"{"servers":[{"name":"alpha","tools":[]}]}"#,
+        r#"{"servers":[{"name":"alpha","command":"true"}]}"#,
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_converge"))

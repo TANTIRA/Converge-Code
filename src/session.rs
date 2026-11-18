@@ -38,6 +38,8 @@ pub struct Session {
     pub permission_mode: String,
     pub source_closed: bool,
     pub mcp_server: Option<String>,
+    // The completion command of this session. A lesson needs a 0 here.
+    pub last_test_status: Option<i32>,
 }
 
 pub fn create(
@@ -66,6 +68,7 @@ pub fn create(
         permission_mode: "dontAsk".to_string(),
         source_closed: false,
         mcp_server: None,
+        last_test_status: None,
     };
     write_record(&session)?;
     Ok(session)
@@ -296,6 +299,7 @@ fn read_session(dir: &Path) -> Result<Option<Session>> {
         permission_mode: record.permission_mode,
         source_closed: record.source_closed,
         mcp_server: record.mcp_server,
+        last_test_status: record.last_test_status,
     }))
 }
 
@@ -307,6 +311,7 @@ fn write_record(session: &Session) -> Result<()> {
         permission_mode: session.permission_mode.clone(),
         source_closed: session.source_closed,
         mcp_server: session.mcp_server.clone(),
+        last_test_status: session.last_test_status,
         goal: session.goal.clone(),
         budget: session.budget,
         used: session.used,
@@ -330,6 +335,8 @@ struct StoredSession {
     source_closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp_server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_test_status: Option<i32>,
     #[serde(default)]
     goal: Option<String>,
     budget: Budget,

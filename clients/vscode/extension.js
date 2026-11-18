@@ -16,6 +16,7 @@ const KERNEL_METHODS = [
   "permission/ask",
   "session/diff",
   "session/status",
+  "session/tasks",
 ];
 
 function convergeHome() {
@@ -146,6 +147,8 @@ function handleMessage(line, handlers) {
     handlers.onDiff && handlers.onDiff(params.diff || "");
   } else if (method === "session/status") {
     handlers.onStatus && handlers.onStatus(params);
+  } else if (method === "session/tasks") {
+    handlers.onTasks && handlers.onTasks(params.tasks || []);
   } else if (message.result) {
     handlers.onResult && handlers.onResult(message.result);
   }
@@ -211,6 +214,11 @@ function activate(context) {
             if (params.text) {
               show(params.text);
             }
+          },
+          onTasks: (tasks) => {
+            tasks.forEach((task) => {
+              show([task.id, task.status, task.goal].filter(Boolean).join("\t"));
+            });
           },
           onResult: (result) => {
             if (result.transcript) {

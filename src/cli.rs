@@ -16,6 +16,7 @@ pub enum Invocation {
     ModeWork(String),
     ModePermission(String),
     Tasks,
+    Plan(String),
     Workflow(String),
     Merge(String, String),
     Schedule(Args),
@@ -49,6 +50,7 @@ impl Invocation {
                     "usage: converge mode work <mode> | permission <mode>",
                 )),
             },
+            "plan" => Ok(Self::Plan(required(&args, 1, "plan action")?)),
             "tasks" => Ok(Self::Tasks),
             "merge" => match (args.get(1), args.get(2).map(String::as_str), args.get(3)) {
                 (Some(id), Some("--test"), Some(test)) if !test.is_empty() => {
